@@ -98,6 +98,39 @@ async fn api_client_poll_persists_top_state() {
     assert_eq!(top_state, 2);
 }
 
+#[tokio::test]
+async fn api_top_n_and_history_top_n_are_independent() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let api_addr = spawn_three_meme_api_server().await;
+    let api_client = ImgflipApiClient::new(format!("http://{api_addr}/get_memes"));
+    let poller = PersistedPoller::new(pool.clone(), temp.path().to_path_buf(), 2);
+
+    let summary = poller
+        .run_api_poll_with_top_n(&api_client, Some(3))
+        .await
+        .expect("api poll should succeed");
+    assert_eq!(summary.events_written, 2);
+
+    let source_records: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_records")
+        .fetch_one(&pool)
+        .await
+        .expect("source record count should query");
+    assert_eq!(source_records, 3);
+
+    let top_state: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM top_state_current")
+        .fetch_one(&pool)
+        .await
+        .expect("top state count should query");
+    assert_eq!(top_state, 2);
+
+    let top_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM top_state_events")
+        .fetch_one(&pool)
+        .await
+        .expect("top state events count should query");
+    assert_eq!(top_events, 2);
+}
+
 async fn spawn_image_server() -> SocketAddr {
     let app = Router::new()
         .route(
@@ -171,6 +204,66 @@ async fn spawn_api_server() -> SocketAddr {
                 (
                     [("content-type", "image/png")],
                     Bytes::from_static(b"image-2"),
+                )
+            }),
+        );
+
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    addr
+}
+
+async fn spawn_three_meme_api_server() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("server bind should succeed");
+    let addr = listener.local_addr().expect("local addr should resolve");
+
+    let payload = format!(
+        "{{\"success\":true,\"data\":{{\"memes\":[{{\"id\":\"11\",\"name\":\"One\",\"url\":\"http://{addr}/img-1.png\",\"width\":100,\"height\":100}},{{\"id\":\"22\",\"name\":\"Two\",\"url\":\"http://{addr}/img-2.png\",\"width\":100,\"height\":100}},{{\"id\":\"33\",\"name\":\"Three\",\"url\":\"http://{addr}/img-3.png\",\"width\":100,\"height\":100}}]}}}}"
+    );
+
+    let app = Router::new()
+        .route(
+            "/get_memes",
+            get(move || {
+                let body = payload.clone();
+                async move { ([("content-type", "application/json")], body) }
+            }),
+        )
+        .route(
+            "/img-1.png",
+            get(|| async {
+                (
+                    [("content-type", "image/png")],
+                    Bytes::from_static(b"image-1"),
+                )
+            }),
+        )
+        .route(
+            "/img-2.png",
+            get(|| async {
+                (
+                    [("content-type", "image/png")],
+                    Bytes::from_static(b"image-2"),
+                )
+            }),
+        )
+        .route(
+            "/img-3.png",
+            get(|| async {
+                (
+                    [("content-type", "image/png")],
+                    Bytes::from_static(b"image-3"),
                 )
             }),
         );

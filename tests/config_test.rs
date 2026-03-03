@@ -40,3 +40,37 @@ fn runtime_config_parses_auth_and_polling_overrides() {
     assert_eq!(cfg.auth.session_ttl_secs, 7200);
     assert!(cfg.auth.secure_cookie);
 }
+
+#[test]
+fn runtime_config_parses_api_top_n_env() {
+    let mut map = std::collections::HashMap::new();
+    map.insert("ADMIN_USER".to_string(), "admin".to_string());
+    map.insert(
+        "ADMIN_PASSWORD_HASH".to_string(),
+        "$argon2id$dummy".to_string(),
+    );
+    map.insert("IMGFLOP_API_TOP_N".to_string(), "25".to_string());
+
+    let cfg = imgflop::config::RuntimeConfig::from_map(&map).expect("runtime config should parse");
+    assert_eq!(cfg.api_top_n, imgflop::config::ApiTopN::Int(25));
+
+    map.insert("IMGFLOP_API_TOP_N".to_string(), "max".to_string());
+    let max_cfg =
+        imgflop::config::RuntimeConfig::from_map(&map).expect("max api top-n should parse");
+    assert!(max_cfg.api_top_n.is_max());
+}
+
+#[test]
+fn runtime_config_rejects_invalid_api_top_n_env() {
+    let mut map = std::collections::HashMap::new();
+    map.insert("ADMIN_USER".to_string(), "admin".to_string());
+    map.insert(
+        "ADMIN_PASSWORD_HASH".to_string(),
+        "$argon2id$dummy".to_string(),
+    );
+    map.insert("IMGFLOP_API_TOP_N".to_string(), "0".to_string());
+
+    let err = imgflop::config::RuntimeConfig::from_map(&map)
+        .expect_err("api top-n of 0 should be rejected");
+    assert!(err.contains("IMGFLOP_API_TOP_N"));
+}

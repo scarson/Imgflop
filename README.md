@@ -95,6 +95,22 @@ stdout = true
 
 ## Local Development
 
+### Runtime Environment
+
+- `ADMIN_USER` (required)
+- `ADMIN_PASSWORD_HASH` (required)
+- `IMGFLOP_API_TOP_N` (`max` by default, or integer `>= 1`)
+- `IMGFLOP_HISTORY_TOP_N` (`100` by default, integer `>= 1`)
+- `IMGFLOP_POLL_INTERVAL_SECS` (`300` by default, integer `>= 1`)
+- `IMGFLOP_BIND` (`127.0.0.1:8080` by default)
+- `IMGFLOP_DB_URL` (`sqlite://imgflop.db?mode=rwc` by default)
+- `IMGFLOP_ASSETS_DIR` (`data/images` by default)
+- `IMGFLOP_API_ENDPOINT` (optional override, defaults to Imgflip public API)
+
+`IMGFLOP_API_TOP_N` and `IMGFLOP_HISTORY_TOP_N` are independent:
+- API ingest candidate count is controlled by `IMGFLOP_API_TOP_N`.
+- Persisted top-state/events are controlled by `IMGFLOP_HISTORY_TOP_N`.
+
 ### Prerequisites
 - Rust toolchain (stable)
 - Docker Desktop (for `rust.testcontainers` scenarios)
