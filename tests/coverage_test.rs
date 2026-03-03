@@ -215,7 +215,7 @@ async fn create_routes_return_expected_statuses() {
         )
         .await
         .expect("create export request should complete");
-    assert_eq!(create_export.status(), StatusCode::ACCEPTED);
+    assert_eq!(create_export.status(), StatusCode::OK);
 }
 
 #[tokio::test]

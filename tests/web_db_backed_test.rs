@@ -1,7 +1,7 @@
 use std::{
     path::Path,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -41,6 +41,56 @@ async fn gallery_page_renders_db_backed_ranked_rows() {
     let html = String::from_utf8_lossy(&body);
     assert!(html.contains("Drake Hotline"));
     assert!(html.contains(&format!("/memes/{meme_id}")));
+}
+
+#[tokio::test]
+async fn gallery_search_filters_top_memes() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let run_id = insert_success_run(&pool).await;
+    let one = insert_meme(&pool, "Drake Hotline").await;
+    let two = insert_meme(&pool, "Distracted Boyfriend").await;
+    insert_top_state(&pool, one, run_id, 1).await;
+    insert_top_state(&pool, two, run_id, 2).await;
+
+    let app = runtime_app(pool.clone(), temp.path().to_path_buf()).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/?q=drake")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("Drake Hotline"));
+    assert!(!html.contains("Distracted Boyfriend"));
+}
+
+#[tokio::test]
+async fn gallery_renders_local_memes_section() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let output_asset = insert_image_asset(&pool, temp.path(), b"created-meme").await;
+    insert_created_meme(&pool, output_asset).await;
+
+    let app = runtime_app(pool.clone(), temp.path().to_path_buf()).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("Local Memes"));
 }
 
 #[tokio::test]
@@ -159,6 +209,162 @@ async fn create_page_renders_template_options_from_db() {
     assert!(html.contains("Select Template"));
     assert!(html.contains("Change My Mind"));
     assert!(html.contains(&format!("/media/image/{asset_id}")));
+    assert!(html.contains(&format!("/create/{meme_id}")));
+}
+
+#[tokio::test]
+async fn create_designer_page_renders_large_template_editor() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let run_id = insert_success_run(&pool).await;
+    let asset_id = insert_image_asset(&pool, temp.path(), b"img-template").await;
+    let meme_id = insert_meme_with_asset(&pool, "This Is Fine", asset_id).await;
+    insert_top_state(&pool, meme_id, run_id, 1).await;
+
+    let app = runtime_app(pool.clone(), temp.path().to_path_buf()).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/create/{meme_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("Designer"));
+    assert!(html.contains("preview-stage"));
+    assert!(html.contains(&format!("/media/image/{asset_id}")));
+}
+
+#[tokio::test]
+async fn admin_upload_adds_template_to_create_gallery() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let app = runtime_app(pool.clone(), temp.path().to_path_buf()).await;
+
+    let login_payload = json!({ "username": "admin", "password": "admin" }).to_string();
+    let login_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(login_payload))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    let session_cookie = login_response
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("session cookie should be set")
+        .to_string();
+
+    let boundary = "X-BOUNDARY-IMGFLOP";
+    let payload = multipart_body(
+        boundary,
+        "Knight Rider",
+        "template.png",
+        "image/png",
+        b"fake-png-template",
+    );
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/templates/upload")
+                .header(header::COOKIE, session_cookie)
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(payload))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(upload.status(), StatusCode::SEE_OTHER);
+
+    let create = app
+        .oneshot(
+            Request::builder()
+                .uri("/create")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    let html = create.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&html).contains("Knight Rider"));
+}
+
+#[tokio::test]
+async fn admin_shutdown_signals_graceful_shutdown() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let scheduler = Arc::new(Scheduler::new());
+    let poll_runtime = Arc::new(PollRuntime::new(
+        pool.clone(),
+        temp.path().to_path_buf(),
+        10,
+        Some("http://127.0.0.1:9/get_memes".to_string()),
+    ));
+    let auth = Arc::new(AuthService::dev_default());
+    let designer = DesignerService::new(pool.clone(), temp.path().to_path_buf());
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let app = web::app_router_runtime_with_shutdown(
+        scheduler,
+        poll_runtime,
+        auth,
+        pool,
+        designer,
+        Some(shutdown_tx),
+    );
+
+    let login_payload = json!({ "username": "admin", "password": "admin" }).to_string();
+    let login_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(login_payload))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    let session_cookie = login_response
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("session cookie should be set")
+        .to_string();
+
+    let shutdown_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/shutdown")
+                .header(header::COOKIE, session_cookie)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(shutdown_response.status(), StatusCode::OK);
+
+    tokio::time::timeout(Duration::from_millis(100), shutdown_rx.changed())
+        .await
+        .expect("shutdown signal should fire")
+        .expect("watch channel should remain open");
+    assert!(*shutdown_rx.borrow());
 }
 
 #[tokio::test]
@@ -262,6 +468,18 @@ async fn insert_image_asset(pool: &sqlx::SqlitePool, root: &Path, bytes: &[u8]) 
         .last_insert_rowid()
 }
 
+async fn insert_created_meme(pool: &sqlx::SqlitePool, output_asset_id: i64) -> i64 {
+    sqlx::query(
+        "INSERT INTO created_memes (base_meme_id, output_asset_id, stored, created_at_utc) VALUES (NULL, ?, 1, ?)",
+    )
+    .bind(output_asset_id)
+    .bind(now_epoch_seconds().to_string())
+    .execute(pool)
+    .await
+    .expect("created meme should insert")
+    .last_insert_rowid()
+}
+
 async fn insert_top_state(pool: &sqlx::SqlitePool, meme_id: i64, run_id: i64, rank: i64) {
     sqlx::query(
         "INSERT INTO top_state_current (scope, meme_id, rank, last_seen_run_id) VALUES ('api', ?, ?, ?)",
@@ -292,4 +510,29 @@ fn now_epoch_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn multipart_body(
+    boundary: &str,
+    title: &str,
+    filename: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\n{title}\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
 }

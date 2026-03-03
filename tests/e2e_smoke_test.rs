@@ -62,5 +62,5 @@ async fn e2e_poll_then_gallery_then_create_export() {
         )
         .await
         .expect("create export request should complete");
-    assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+    assert_eq!(create_response.status(), StatusCode::OK);
 }

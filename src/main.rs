@@ -50,12 +50,14 @@ async fn main() {
     );
 
     let scheduler = Arc::new(Scheduler::new());
-    let app = web::app_router_runtime(
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let app = web::app_router_runtime_with_shutdown(
         Arc::clone(&scheduler),
         Arc::clone(&poll_runtime),
         auth,
         pool,
         designer,
+        Some(shutdown_tx),
     );
     let scheduled_runtime = Arc::clone(&poll_runtime);
     let scheduled_scheduler = Arc::clone(&scheduler);
@@ -80,7 +82,15 @@ async fn main() {
 
     tracing::info!(bind = %bind, "starting imgflop web server");
 
-    if let Err(err) = axum::serve(listener, app).await {
+    let shutdown_future = async move {
+        let _ = shutdown_rx.changed().await;
+        tracing::info!("received shutdown request");
+    };
+
+    if let Err(err) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_future)
+        .await
+    {
         panic!("server error: {err}");
     }
 }

@@ -97,6 +97,54 @@ impl DesignerService {
         Ok(Some(created_id))
     }
 
+    pub async fn upload_template(
+        &self,
+        title: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<i64, sqlx::Error> {
+        if !mime.starts_with("image/") {
+            return Err(to_sqlx_protocol_error(
+                "template upload must be an image MIME type",
+            ));
+        }
+        if title.trim().is_empty() {
+            return Err(to_sqlx_protocol_error("template title must not be empty"));
+        }
+
+        let stored_asset = self
+            .asset_store
+            .store_bytes(mime, bytes)
+            .await
+            .map_err(|err| to_sqlx_protocol_error(format!("{err:?}")))?;
+        let asset_id: i64 = sqlx::query_scalar("SELECT id FROM image_assets WHERE sha256 = ?")
+            .bind(&stored_asset.sha256)
+            .fetch_one(&self.pool)
+            .await?;
+
+        let now = now_epoch_seconds().to_string();
+        let insert = query(
+            "INSERT INTO memes (title, page_url, first_seen_at_utc, last_seen_at_utc, image_asset_id) VALUES (?, NULL, ?, ?, ?)",
+        )
+        .bind(title.trim())
+        .bind(&now)
+        .bind(&now)
+        .bind(asset_id)
+        .execute(&self.pool)
+        .await?;
+        let meme_id = insert.last_insert_rowid();
+
+        query(
+            "INSERT INTO source_records (source, source_meme_id, meme_id, raw_payload) VALUES ('admin_upload', ?, ?, NULL)",
+        )
+        .bind(meme_id.to_string())
+        .bind(meme_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(meme_id)
+    }
+
     async fn load_template_image_bytes(
         &self,
         base_meme_id: Option<i64>,

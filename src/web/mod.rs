@@ -3,13 +3,14 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Redirect},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use tokio::sync::watch;
 
 use crate::{
     auth::{AuthService, session::extract_session_token},
@@ -29,6 +30,7 @@ struct AppState {
     auth: Arc<AuthService>,
     pool: Option<SqlitePool>,
     designer: Option<DesignerService>,
+    shutdown_signal: Option<watch::Sender<bool>>,
 }
 
 pub fn app_router() -> Router {
@@ -40,6 +42,7 @@ pub fn app_router() -> Router {
         auth,
         pool: None,
         designer: None,
+        shutdown_signal: None,
     })
 }
 
@@ -58,6 +61,7 @@ pub fn app_router_with_scheduler_and_poll_runtime(
         auth,
         pool: None,
         designer: None,
+        shutdown_signal: None,
     })
 }
 
@@ -68,12 +72,24 @@ pub fn app_router_runtime(
     pool: SqlitePool,
     designer: DesignerService,
 ) -> Router {
+    app_router_runtime_with_shutdown(scheduler, poll_runtime, auth, pool, designer, None)
+}
+
+pub fn app_router_runtime_with_shutdown(
+    scheduler: Arc<Scheduler>,
+    poll_runtime: Arc<PollRuntime>,
+    auth: Arc<AuthService>,
+    pool: SqlitePool,
+    designer: DesignerService,
+    shutdown_signal: Option<watch::Sender<bool>>,
+) -> Router {
     app_router_with_state(AppState {
         scheduler,
         poll_runtime: Some(poll_runtime),
         auth,
         pool: Some(pool),
         designer: Some(designer),
+        shutdown_signal,
     })
 }
 
@@ -82,21 +98,35 @@ fn app_router_with_state(state: AppState) -> Router {
         .route("/", get(gallery_page))
         .route("/memes/{id}", get(meme_detail_page))
         .route("/create", get(create_page))
+        .route("/create/{id}", get(create_designer_page))
         .route("/create/export", post(create_export))
         .route("/media/image/{id}", get(media_image))
         .route("/health", get(|| async { "ok" }))
         .route("/static/app.css", get(stylesheet))
         .route("/admin", get(admin_home))
-        .route("/admin/login", post(admin_login))
+        .route("/admin/login", get(admin_login_page).post(admin_login))
         .route("/admin/logout", post(admin_logout))
         .route("/admin/poll", post(trigger_manual_poll))
+        .route("/admin/templates/upload", post(admin_upload_template))
+        .route("/admin/shutdown", post(admin_shutdown))
         .with_state(state)
 }
 
-async fn gallery_page(State(state): State<AppState>) -> Html<String> {
+async fn gallery_page(
+    State(state): State<AppState>,
+    Query(query): Query<GalleryQuery>,
+) -> Html<String> {
+    let search = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if let Some(pool) = state.pool.as_ref() {
-        match load_gallery_rows(pool).await {
-            Ok(rows) => return Html(render_gallery_html(&rows)),
+        match load_gallery_rows(pool, search).await {
+            Ok(rows) => match load_local_meme_rows(pool).await {
+                Ok(local_memes) => return Html(render_gallery_html(&rows, &local_memes, search)),
+                Err(err) => tracing::error!(error = %err, "failed to load local meme data"),
+            },
             Err(err) => tracing::error!(error = %err, "failed to load gallery data"),
         }
     }
@@ -118,7 +148,7 @@ async fn meme_detail_page(State(state): State<AppState>, Path(meme_id): Path<i64
 async fn create_page(State(state): State<AppState>) -> Html<String> {
     if let Some(pool) = state.pool.as_ref() {
         match load_create_templates(pool).await {
-            Ok(rows) => return Html(render_create_html(&rows)),
+            Ok(rows) => return Html(render_create_template_picker_html(&rows)),
             Err(err) => tracing::error!(error = %err, "failed to load create templates"),
         }
     }
@@ -126,30 +156,65 @@ async fn create_page(State(state): State<AppState>) -> Html<String> {
     Html(routes::create::render().to_string())
 }
 
-async fn create_export(State(state): State<AppState>, body: Bytes) -> StatusCode {
+async fn create_designer_page(
+    State(state): State<AppState>,
+    Path(template_id): Path<i64>,
+) -> impl IntoResponse {
+    let Some(pool) = state.pool.as_ref() else {
+        return Html(routes::create::render().to_string()).into_response();
+    };
+
+    match load_create_template_detail(pool, template_id).await {
+        Ok(Some(template)) => Html(render_create_designer_html(&template)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, template_id, "failed to load template detail");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn create_export(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     let parsed = if body.is_empty() {
         CreateExportRequest::default()
     } else {
         serde_json::from_slice::<CreateExportRequest>(&body).unwrap_or_default()
     };
 
-    if let Some(designer) = state.designer.as_ref() {
-        let layers: Vec<TextLayer> = parsed
-            .layers
-            .unwrap_or_default()
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        if let Err(err) = designer
-            .export_from_template(parsed.base_meme_id, parsed.store.unwrap_or(true), &layers)
-            .await
-        {
+    let Some(designer) = state.designer.as_ref() else {
+        return (
+            StatusCode::OK,
+            Json(CreateExportResponse {
+                stored: false,
+                created_id: None,
+            }),
+        )
+            .into_response();
+    };
+
+    let layers: Vec<TextLayer> = parsed
+        .layers
+        .unwrap_or_default()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    match designer
+        .export_from_template(parsed.base_meme_id, parsed.store.unwrap_or(true), &layers)
+        .await
+    {
+        Ok(created_id) => (
+            StatusCode::OK,
+            Json(CreateExportResponse {
+                stored: created_id.is_some(),
+                created_id,
+            }),
+        )
+            .into_response(),
+        Err(err) => {
             tracing::error!(error = %err, "create export failed");
-            return StatusCode::INTERNAL_SERVER_ERROR;
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
-
-    StatusCode::ACCEPTED
 }
 
 async fn media_image(
@@ -183,6 +248,10 @@ async fn stylesheet() -> ([(&'static str, &'static str); 1], &'static str) {
     )
 }
 
+async fn admin_login_page() -> Html<String> {
+    Html(render_admin_login_html(None))
+}
+
 async fn admin_home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if state.auth.is_authenticated_headers(&headers) {
         if let Some(pool) = state.pool.as_ref() {
@@ -197,7 +266,7 @@ async fn admin_home(State(state): State<AppState>, headers: HeaderMap) -> impl I
             Html(routes::admin::render()).into_response()
         }
     } else {
-        StatusCode::UNAUTHORIZED.into_response()
+        Redirect::to("/admin/login").into_response()
     }
 }
 
@@ -207,10 +276,29 @@ struct LoginRequest {
     password: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct GalleryQuery {
+    q: Option<String>,
+}
+
 async fn admin_login(
     State(state): State<AppState>,
-    Json(payload): Json<LoginRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
+    let expects_json = request_is_json(&headers);
+    let parsed = parse_login_request(&headers, &body);
+    let payload = match parsed {
+        Ok(value) => value,
+        Err(_) => {
+            return if expects_json {
+                StatusCode::BAD_REQUEST.into_response()
+            } else {
+                Html(render_admin_login_html(Some("Invalid login payload"))).into_response()
+            };
+        }
+    };
+
     match state.auth.login(&payload.username, &payload.password) {
         Ok(token) => {
             let mut cookie = format!(
@@ -225,9 +313,24 @@ async fn admin_login(
                 header::SET_COOKIE,
                 HeaderValue::from_str(&cookie).expect("cookie should be valid"),
             );
+            if !expects_json {
+                *response.status_mut() = StatusCode::SEE_OTHER;
+                response
+                    .headers_mut()
+                    .insert(header::LOCATION, HeaderValue::from_static("/admin"));
+            }
             response
         }
-        Err(_) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => {
+            if expects_json {
+                StatusCode::UNAUTHORIZED.into_response()
+            } else {
+                Html(render_admin_login_html(Some(
+                    "Invalid username or password",
+                )))
+                .into_response()
+            }
+        }
     }
 }
 
@@ -254,11 +357,95 @@ async fn trigger_manual_poll(State(state): State<AppState>, headers: HeaderMap) 
     StatusCode::ACCEPTED
 }
 
+async fn admin_upload_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    if !state.auth.is_authenticated_headers(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(designer) = state.designer.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+
+    let mut title: Option<String> = None;
+    let mut mime: Option<String> = None;
+    let mut file_bytes: Option<Vec<u8>> = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!(error = %err, "template upload field read failed");
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        };
+        let Some(field) = field else {
+            break;
+        };
+
+        match field.name() {
+            Some("title") => {
+                if let Ok(value) = field.text().await {
+                    title = Some(value);
+                }
+            }
+            Some("file") => {
+                mime = field.content_type().map(str::to_string);
+                if let Ok(value) = field.bytes().await {
+                    let bytes = value.to_vec();
+                    if bytes.len() > 10 * 1024 * 1024 {
+                        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                    }
+                    file_bytes = Some(bytes);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(file_bytes) = file_bytes else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let title = title.unwrap_or_else(|| "Uploaded Template".to_string());
+    let mime = mime.unwrap_or_else(|| "application/octet-stream".to_string());
+
+    match designer.upload_template(&title, &mime, &file_bytes).await {
+        Ok(meme_id) => Redirect::to(&format!("/create/{meme_id}")).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "template upload persistence failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn admin_shutdown(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !state.auth.is_authenticated_headers(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(signal) = state.shutdown_signal.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+
+    let _ = signal.send(true);
+    Html(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Shutting Down</title><link rel="stylesheet" href="/static/app.css"/></head><body><main><section class="panel"><h1>Server Shutdown Requested</h1><p>Imgflop is shutting down gracefully. You can close this tab.</p></section></main></body></html>"#.to_string(),
+    )
+    .into_response()
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct CreateExportRequest {
     store: Option<bool>,
     base_meme_id: Option<i64>,
     layers: Option<Vec<CreateLayer>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateExportResponse {
+    stored: bool,
+    created_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,22 +519,44 @@ struct AdminErrorRow {
 #[derive(Debug)]
 struct CreateTemplateRow {
     meme_id: i64,
-    rank: i64,
+    rank: Option<i64>,
+    is_local_template: bool,
     title: String,
     image_asset_id: Option<i64>,
 }
 
-async fn load_gallery_rows(pool: &SqlitePool) -> Result<Vec<GalleryRow>, sqlx::Error> {
+#[derive(Debug)]
+struct CreateTemplateDetail {
+    meme_id: i64,
+    title: String,
+    image_asset_id: i64,
+}
+
+#[derive(Debug)]
+struct LocalMemeRow {
+    id: i64,
+    created_at_utc: String,
+    output_asset_id: i64,
+}
+
+async fn load_gallery_rows(
+    pool: &SqlitePool,
+    search: Option<&str>,
+) -> Result<Vec<GalleryRow>, sqlx::Error> {
+    let search_like = search.map(|value| format!("%{}%", value.to_ascii_lowercase()));
     let rows = sqlx::query_as::<_, (i64, i64, String, Option<String>, Option<i64>)>(
         r#"
         SELECT t.meme_id, t.rank, m.title, m.page_url, m.image_asset_id
         FROM top_state_current t
         JOIN memes m ON m.id = t.meme_id
         WHERE t.scope = 'api'
+          AND (? IS NULL OR LOWER(m.title) LIKE ?)
         ORDER BY t.rank ASC
         LIMIT 200
         "#,
     )
+    .bind(search_like.as_deref())
+    .bind(search_like.as_deref())
     .fetch_all(pool)
     .await?;
 
@@ -362,6 +571,29 @@ async fn load_gallery_rows(pool: &SqlitePool) -> Result<Vec<GalleryRow>, sqlx::E
                 image_asset_id,
             },
         )
+        .collect())
+}
+
+async fn load_local_meme_rows(pool: &SqlitePool) -> Result<Vec<LocalMemeRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (i64, String, i64)>(
+        r#"
+        SELECT id, created_at_utc, output_asset_id
+        FROM created_memes
+        WHERE stored = 1
+        ORDER BY id DESC
+        LIMIT 60
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, created_at_utc, output_asset_id)| LocalMemeRow {
+            id,
+            created_at_utc,
+            output_asset_id,
+        })
         .collect())
 }
 
@@ -457,14 +689,28 @@ async fn load_admin_rows(
 }
 
 async fn load_create_templates(pool: &SqlitePool) -> Result<Vec<CreateTemplateRow>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (i64, i64, String, Option<i64>)>(
+    let rows = sqlx::query_as::<_, (i64, Option<i64>, i64, String, Option<i64>)>(
         r#"
-        SELECT m.id, t.rank, m.title, m.image_asset_id
-        FROM top_state_current t
-        JOIN memes m ON m.id = t.meme_id
-        WHERE t.scope = 'api'
-        ORDER BY t.rank ASC
-        LIMIT 100
+        SELECT m.id,
+               t.rank,
+               CASE WHEN t.id IS NULL THEN 1 ELSE 0 END AS is_local_template,
+               m.title,
+               m.image_asset_id
+        FROM memes m
+        LEFT JOIN top_state_current t
+          ON t.meme_id = m.id
+         AND t.scope = 'api'
+        WHERE m.image_asset_id IS NOT NULL
+          AND (
+                t.id IS NOT NULL
+                OR EXISTS (
+                    SELECT 1 FROM source_records s
+                    WHERE s.meme_id = m.id
+                      AND s.source = 'admin_upload'
+                )
+          )
+        ORDER BY is_local_template ASC, t.rank ASC, m.id DESC
+        LIMIT 200
         "#,
     )
     .fetch_all(pool)
@@ -472,18 +718,56 @@ async fn load_create_templates(pool: &SqlitePool) -> Result<Vec<CreateTemplateRo
 
     Ok(rows
         .into_iter()
-        .map(|(meme_id, rank, title, image_asset_id)| CreateTemplateRow {
-            meme_id,
-            rank,
-            title,
-            image_asset_id,
-        })
+        .map(
+            |(meme_id, rank, is_local_template, title, image_asset_id)| CreateTemplateRow {
+                meme_id,
+                rank,
+                is_local_template: is_local_template == 1,
+                title,
+                image_asset_id,
+            },
+        )
         .collect())
 }
 
-fn render_gallery_html(rows: &[GalleryRow]) -> String {
+async fn load_create_template_detail(
+    pool: &SqlitePool,
+    template_id: i64,
+) -> Result<Option<CreateTemplateDetail>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (i64, String, i64)>(
+        r#"
+        SELECT m.id, m.title, m.image_asset_id
+        FROM memes m
+        WHERE m.id = ?
+          AND m.image_asset_id IS NOT NULL
+        "#,
+    )
+    .bind(template_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(
+        row.map(|(meme_id, title, image_asset_id)| CreateTemplateDetail {
+            meme_id,
+            title,
+            image_asset_id,
+        }),
+    )
+}
+
+fn render_gallery_html(
+    rows: &[GalleryRow],
+    local_memes: &[LocalMemeRow],
+    search: Option<&str>,
+) -> String {
+    let search_value = search.unwrap_or_default();
     let mut html = String::from(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Top Memes</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Top Memes</h1><nav><a href="/create">Create</a> <a href="/admin">Admin</a></nav></header><main class="gallery">"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Top Memes</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Top Memes</h1><nav><a href="/create">Create Meme</a> <a href="/admin">Admin</a></nav></header><main><section class="panel"><form class="searchbar" method="get" action="/"><label for="q">Search Top Memes</label><div class="search-controls"><input id="q" type="search" name="q" placeholder="Search by title" value="" /><button type="submit">Search</button><a class="ghost-link" href="/">Clear</a></div></form></section><section><h2>Imgflip Feed</h2><div class="gallery">"#,
+    );
+    html = html.replacen(
+        "value=\"\"",
+        &format!(r#"value="{}""#, escape_html(search_value)),
+        1,
     );
 
     if rows.is_empty() {
@@ -516,7 +800,20 @@ fn render_gallery_html(rows: &[GalleryRow]) -> String {
         }
     }
 
-    html.push_str("</main></body></html>");
+    html.push_str("</div></section><section><h2>Local Memes</h2><div class=\"gallery\">");
+    if local_memes.is_empty() {
+        html.push_str(r#"<article class="card">No local memes yet. Use Create Meme and store an export.</article>"#);
+    } else {
+        for meme in local_memes {
+            html.push_str(&format!(
+                r#"<article class="card"><img class="thumb" src="/media/image/{asset_id}" alt="Local meme {id}" loading="lazy"/><h3>Local #{id}</h3><p>Created at {at}</p></article>"#,
+                asset_id = meme.output_asset_id,
+                id = meme.id,
+                at = escape_html(&meme.created_at_utc),
+            ));
+        }
+    }
+    html.push_str("</div></section></main></body></html>");
     html
 }
 
@@ -570,7 +867,7 @@ fn render_missing_detail_html(meme_id: i64) -> String {
 
 fn render_admin_html(runs: &[AdminRunRow], errors: &[AdminErrorRow]) -> String {
     let mut html = String::from(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Admin</title><link rel="stylesheet" href="/static/app.css"/></head><body><main><h1>Admin</h1><p>Authenticated admin view.</p><h2>Manual Poll</h2><p>POST /admin/poll with your session cookie to trigger a run.</p><h2>Recent Poll Runs</h2><table><thead><tr><th>ID</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Admin</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Admin</h1><nav><a href="/">Gallery</a> <a href="/create">Create Meme</a></nav></header><main><section class="panel"><h2>Manual Poll</h2><form method="post" action="/admin/poll"><button type="submit">Run Poll Now</button></form></section><section class="panel"><h2>Upload Template</h2><form method="post" action="/admin/templates/upload" enctype="multipart/form-data" class="create-form"><label>Template Name<input type="text" name="title" maxlength="120" required/></label><label>Image File<input type="file" name="file" accept="image/*" required/></label><button type="submit">Upload Template</button></form></section><section class="panel"><h2>Recent Poll Runs</h2><table><thead><tr><th>ID</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>"#,
     );
 
     if runs.is_empty() {
@@ -591,7 +888,7 @@ fn render_admin_html(runs: &[AdminRunRow], errors: &[AdminErrorRow]) -> String {
         }
     }
 
-    html.push_str(r#"</tbody></table><h2>Recent Poll Errors</h2><table><thead><tr><th>Run</th><th>Kind</th><th>Message</th><th>At</th></tr></thead><tbody>"#);
+    html.push_str(r#"</tbody></table></section><section class="panel"><h2>Recent Poll Errors</h2><table><thead><tr><th>Run</th><th>Kind</th><th>Message</th><th>At</th></tr></thead><tbody>"#);
     if errors.is_empty() {
         html.push_str(r#"<tr><td colspan="4">No errors.</td></tr>"#);
     } else {
@@ -605,13 +902,13 @@ fn render_admin_html(runs: &[AdminRunRow], errors: &[AdminErrorRow]) -> String {
             ));
         }
     }
-    html.push_str("</tbody></table></main></body></html>");
+    html.push_str(r#"</tbody></table></section><section class="panel admin-actions"><form method="post" action="/admin/logout"><button type="submit">Logout</button></form><form method="post" action="/admin/shutdown" onsubmit="return confirm('Shut down Imgflop server now?');"><button type="submit" class="danger">Shut Down Server</button></form></section></main></body></html>"#);
     html
 }
 
-fn render_create_html(templates: &[CreateTemplateRow]) -> String {
+fn render_create_template_picker_html(templates: &[CreateTemplateRow]) -> String {
     let mut html = String::from(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Create Meme</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Create Meme</h1><nav><a href="/">Gallery</a> <a href="/admin">Admin</a></nav></header><main class="create-layout"><section class="panel"><h2>Select Template</h2><div class="template-grid">"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Create Meme</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Create Meme</h1><nav><a href="/">Gallery</a> <a href="/admin">Admin</a></nav></header><main><section class="panel"><h2>Select Template</h2><p>Pick a template to open the full designer.</p><div class="template-grid">"#,
     );
 
     if templates.is_empty() {
@@ -619,8 +916,7 @@ fn render_create_html(templates: &[CreateTemplateRow]) -> String {
             r#"<p>No templates available yet. Trigger a poll from admin to load meme templates.</p>"#,
         );
     } else {
-        for (index, template) in templates.iter().enumerate() {
-            let checked = if index == 0 { " checked" } else { "" };
+        for template in templates {
             let thumb = template
                 .image_asset_id
                 .map(|asset_id| {
@@ -633,22 +929,47 @@ fn render_create_html(templates: &[CreateTemplateRow]) -> String {
                     r#"<div class="template-thumb placeholder">No Preview</div>"#.to_string()
                 });
 
+            let rank_label = template
+                .rank
+                .map(|rank| format!("#{rank}"))
+                .unwrap_or_else(|| "Local".to_string());
+            let origin = if template.is_local_template {
+                "Uploaded template"
+            } else {
+                "Imgflip feed"
+            };
             html.push_str(&format!(
-                r#"<label class="template-option"><input type="radio" name="base_meme_id" value="{meme_id}"{checked}/><span class="template-meta">#{rank}</span>{thumb}<span class="template-title">{title}</span></label>"#,
+                r#"<a class="template-option" href="/create/{meme_id}"><span class="template-meta">{rank_label} · {origin}</span>{thumb}<span class="template-title">{title}</span></a>"#,
                 meme_id = template.meme_id,
-                checked = checked,
-                rank = template.rank,
+                rank_label = rank_label,
+                origin = origin,
                 thumb = thumb,
                 title = escape_html(&template.title),
             ));
         }
     }
 
-    html.push_str(
-        r##"</div></section><section class="panel"><h2>Text Layers</h2><form id="create-form" class="create-form"><label>Top Text<input type="text" name="top_text" value="TOP TEXT" maxlength="120"/></label><label>Bottom Text<input type="text" name="bottom_text" value="BOTTOM TEXT" maxlength="120"/></label><label>Scale<input type="number" name="scale" value="4" min="1" max="10"/></label><label>Color<input type="color" name="color_hex" value="#ffffff"/></label><label>Bottom Y<input type="number" name="bottom_y" value="360" min="0" max="2000"/></label><label class="checkbox-row"><input type="checkbox" name="store" checked/> Store export in local DB</label><button type="submit">Render + Export</button></form><p id="create-result" class="status"></p></section></main><script>(function(){const form=document.getElementById('create-form');const result=document.getElementById('create-result');if(!form){return;}form.addEventListener('submit',async function(ev){ev.preventDefault();result.textContent='Rendering...';const selected=document.querySelector('input[name="base_meme_id"]:checked');const topText=form.top_text.value.trim();const bottomText=form.bottom_text.value.trim();const scale=Math.max(1,Number(form.scale.value)||4);const color=form.color_hex.value||'#ffffff';const bottomY=Math.max(0,Number(form.bottom_y.value)||360);const layers=[];if(topText){layers.push({text:topText,x:24,y:24,scale:scale,color_hex:color});}if(bottomText){layers.push({text:bottomText,x:24,y:bottomY,scale:scale,color_hex:color});}const payload={store:!!form.store.checked,base_meme_id:selected?Number(selected.value):null,layers:layers};try{const res=await fetch('/create/export',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});if(res.ok){result.textContent='Export accepted.';}else{result.textContent='Export failed ('+res.status+').';}}catch(_err){result.textContent='Network error while exporting.';}});})();</script></body></html>"##,
-    );
+    html.push_str("</div></section></main></body></html>");
 
     html
+}
+
+fn render_create_designer_html(template: &CreateTemplateDetail) -> String {
+    format!(
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Designer</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Designer: {title}</h1><nav><a href="/create">Template Picker</a> <a href="/">Gallery</a> <a href="/admin">Admin</a></nav></header><main class="designer-layout"><section class="panel"><h2>Live Preview</h2><div id="preview-stage" class="preview-stage"><img id="preview-base" src="/media/image/{asset_id}" alt="{title} template"/><div id="overlay-top" class="preview-text">TOP TEXT</div><div id="overlay-bottom" class="preview-text">BOTTOM TEXT</div></div></section><section class="panel"><h2>Layer Editor</h2><form id="designer-form" class="create-form"><input type="hidden" name="base_meme_id" value="{meme_id}"/><label>Top Text<input type="text" name="top_text" value="TOP TEXT" maxlength="120"/></label><label>Bottom Text<input type="text" name="bottom_text" value="BOTTOM TEXT" maxlength="120"/></label><label>Text Scale<input type="range" name="scale" value="4" min="1" max="12"/></label><label>Text Color<input type="color" name="color_hex" value="#ffffff"/></label><label>Top X<input type="number" name="top_x" value="24" min="0" max="3000"/></label><label>Top Y<input type="number" name="top_y" value="24" min="0" max="3000"/></label><label>Bottom X<input type="number" name="bottom_x" value="24" min="0" max="3000"/></label><label>Bottom Y<input type="number" name="bottom_y" value="360" min="0" max="3000"/></label><label class="checkbox-row"><input type="checkbox" name="store" checked/> Store export in local DB</label><button type="submit">Render + Export</button></form><p id="designer-status" class="status"></p></section></main><script>(function(){{const form=document.getElementById('designer-form');const top=document.getElementById('overlay-top');const bottom=document.getElementById('overlay-bottom');const status=document.getElementById('designer-status');function sync(){{const scale=Math.max(1,Number(form.scale.value)||4);const color=form.color_hex.value||'#ffffff';top.textContent=form.top_text.value||'';bottom.textContent=form.bottom_text.value||'';top.style.left=(Number(form.top_x.value)||0)+'px';top.style.top=(Number(form.top_y.value)||0)+'px';bottom.style.left=(Number(form.bottom_x.value)||0)+'px';bottom.style.top=(Number(form.bottom_y.value)||0)+'px';top.style.color=color;bottom.style.color=color;top.style.fontSize=(scale*10)+'px';bottom.style.fontSize=(scale*10)+'px';}}form.addEventListener('input',sync);sync();form.addEventListener('submit',async function(ev){{ev.preventDefault();status.textContent='Rendering...';const scale=Math.max(1,Number(form.scale.value)||4);const color=form.color_hex.value||'#ffffff';const layers=[];if((form.top_text.value||'').trim()){{layers.push({{text:form.top_text.value.trim(),x:Number(form.top_x.value)||24,y:Number(form.top_y.value)||24,scale:scale,color_hex:color}});}}if((form.bottom_text.value||'').trim()){{layers.push({{text:form.bottom_text.value.trim(),x:Number(form.bottom_x.value)||24,y:Number(form.bottom_y.value)||360,scale:scale,color_hex:color}});}}const payload={{store:!!form.store.checked,base_meme_id:Number(form.base_meme_id.value),layers:layers}};try{{const res=await fetch('/create/export',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(payload)}});if(!res.ok){{status.textContent='Export failed ('+res.status+').';return;}}const data=await res.json();if(data.stored&&data.created_id){{status.textContent='Stored local meme #'+data.created_id;}}else{{status.textContent='Rendered export (not stored).';}}}}catch(_err){{status.textContent='Network error while exporting.';}}}});}})();</script></body></html>"##,
+        title = escape_html(&template.title),
+        asset_id = template.image_asset_id,
+        meme_id = template.meme_id
+    )
+}
+
+fn render_admin_login_html(error: Option<&str>) -> String {
+    let error_html = error
+        .map(|value| format!(r#"<p class="status error">{}</p>"#, escape_html(value)))
+        .unwrap_or_default();
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Admin Login</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Admin Login</h1><nav><a href="/">Gallery</a> <a href="/create">Create Meme</a></nav></header><main><section class="panel"><h2>Sign In</h2>{error_html}<form method="post" action="/admin/login" class="create-form"><label>Username<input type="text" name="username" required/></label><label>Password<input type="password" name="password" required/></label><button type="submit">Login</button></form></section></main></body></html>"#,
+    )
 }
 
 fn parse_hex_color(input: &str) -> Option<[u8; 4]> {
@@ -660,6 +981,22 @@ fn parse_hex_color(input: &str) -> Option<[u8; 4]> {
     let g = u8::from_str_radix(&value[2..4], 16).ok()?;
     let b = u8::from_str_radix(&value[4..6], 16).ok()?;
     Some([r, g, b, 255])
+}
+
+fn request_is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("application/json"))
+        .unwrap_or(false)
+}
+
+fn parse_login_request(headers: &HeaderMap, body: &[u8]) -> Result<LoginRequest, String> {
+    if request_is_json(headers) {
+        return serde_json::from_slice(body).map_err(|err| err.to_string());
+    }
+
+    serde_urlencoded::from_bytes(body).map_err(|err| err.to_string())
 }
 
 fn escape_html(input: &str) -> String {
