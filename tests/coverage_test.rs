@@ -186,7 +186,14 @@ async fn login_allows_admin_page_access() {
         )
         .await
         .expect("logout request should complete");
-    assert_eq!(logout_response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(logout_response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        logout_response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/")
+    );
 }
 
 #[tokio::test]

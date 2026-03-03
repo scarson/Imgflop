@@ -52,6 +52,8 @@ async fn gallery_search_filters_top_memes() {
     let two = insert_meme(&pool, "Distracted Boyfriend").await;
     insert_top_state(&pool, one, run_id, 1).await;
     insert_top_state(&pool, two, run_id, 2).await;
+    let local_asset = insert_image_asset(&pool, temp.path(), b"local-meme").await;
+    insert_created_meme_with_template(&pool, local_asset, two).await;
 
     let app = runtime_app(pool.clone(), temp.path().to_path_buf()).await;
     let response = app
@@ -368,6 +370,61 @@ async fn admin_shutdown_signals_graceful_shutdown() {
 }
 
 #[tokio::test]
+async fn create_export_downloads_png_and_stores_when_requested() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let run_id = insert_success_run(&pool).await;
+    let template_png = render::render_png_bytes(&[]).expect("png should render");
+    let asset_id = insert_image_asset(&pool, temp.path(), &template_png).await;
+    let meme_id = insert_meme_with_asset(&pool, "Doge", asset_id).await;
+    insert_top_state(&pool, meme_id, run_id, 1).await;
+
+    let app = runtime_app(pool.clone(), temp.path().to_path_buf()).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/create/export")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "store": true,
+                        "download": true,
+                        "base_meme_id": meme_id,
+                        "layers": [{"text":"wow","x":20,"y":24,"scale":4,"color_hex":"#FFFFFF"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .contains("attachment")
+    );
+
+    let created_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM created_memes")
+        .fetch_one(&pool)
+        .await
+        .expect("created count should query");
+    assert!(created_count >= 1);
+}
+
+#[tokio::test]
 async fn media_route_serves_local_asset_bytes() {
     let pool = db::test_pool().await;
     let temp = TempDir::new().expect("temp dir should create");
@@ -472,6 +529,23 @@ async fn insert_created_meme(pool: &sqlx::SqlitePool, output_asset_id: i64) -> i
     sqlx::query(
         "INSERT INTO created_memes (base_meme_id, output_asset_id, stored, created_at_utc) VALUES (NULL, ?, 1, ?)",
     )
+    .bind(output_asset_id)
+    .bind(now_epoch_seconds().to_string())
+    .execute(pool)
+    .await
+    .expect("created meme should insert")
+    .last_insert_rowid()
+}
+
+async fn insert_created_meme_with_template(
+    pool: &sqlx::SqlitePool,
+    output_asset_id: i64,
+    base_meme_id: i64,
+) -> i64 {
+    sqlx::query(
+        "INSERT INTO created_memes (base_meme_id, output_asset_id, stored, created_at_utc) VALUES (?, ?, 1, ?)",
+    )
+    .bind(base_meme_id)
     .bind(output_asset_id)
     .bind(now_epoch_seconds().to_string())
     .execute(pool)

@@ -43,14 +43,14 @@ impl DesignerService {
         store: bool,
         layers: &[TextLayer],
     ) -> Result<Option<i64>, sqlx::Error> {
-        let base_image = self.load_template_image_bytes(base_meme_id).await?;
         let effective_layers: Vec<TextLayer> = if layers.is_empty() {
             vec![TextLayer::default()]
         } else {
             layers.to_vec()
         };
-        let bytes = render::render_png_bytes_with_base(base_image.as_deref(), &effective_layers)
-            .map_err(to_sqlx_protocol_error)?;
+        let bytes = self
+            .render_png_from_template(base_meme_id, &effective_layers)
+            .await?;
         if !store {
             return Ok(None);
         }
@@ -95,6 +95,21 @@ impl DesignerService {
         }
 
         Ok(Some(created_id))
+    }
+
+    pub async fn render_png_from_template(
+        &self,
+        base_meme_id: Option<i64>,
+        layers: &[TextLayer],
+    ) -> Result<Vec<u8>, sqlx::Error> {
+        let base_image = self.load_template_image_bytes(base_meme_id).await?;
+        let effective_layers: Vec<TextLayer> = if layers.is_empty() {
+            vec![TextLayer::default()]
+        } else {
+            layers.to_vec()
+        };
+        render::render_png_bytes_with_base(base_image.as_deref(), &effective_layers)
+            .map_err(to_sqlx_protocol_error)
     }
 
     pub async fn upload_template(

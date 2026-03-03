@@ -124,7 +124,7 @@ async fn gallery_page(
         .filter(|value| !value.is_empty());
     if let Some(pool) = state.pool.as_ref() {
         match load_gallery_rows(pool, search).await {
-            Ok(rows) => match load_local_meme_rows(pool).await {
+            Ok(rows) => match load_local_meme_rows(pool, search).await {
                 Ok(local_memes) => return Html(render_gallery_html(&rows, &local_memes, search)),
                 Err(err) => tracing::error!(error = %err, "failed to load local meme data"),
             },
@@ -199,8 +199,53 @@ async fn create_export(State(state): State<AppState>, body: Bytes) -> impl IntoR
         .into_iter()
         .map(Into::into)
         .collect();
+    let should_store = parsed.store.unwrap_or(true);
+    let should_download = parsed.download.unwrap_or(false);
+
+    if should_download {
+        let png = match designer
+            .render_png_from_template(parsed.base_meme_id, &layers)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::error!(error = %err, "create export render failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let created_id = if should_store {
+            match designer
+                .export_from_template(parsed.base_meme_id, true, &layers)
+                .await
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::error!(error = %err, "create export store failed");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut response = (StatusCode::OK, png).into_response();
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+        response.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=\"imgflop-export.png\""),
+        );
+        if let Some(id) = created_id
+            && let Ok(value) = HeaderValue::from_str(&id.to_string())
+        {
+            response.headers_mut().insert("x-imgflop-created-id", value);
+        }
+        return response;
+    }
+
     match designer
-        .export_from_template(parsed.base_meme_id, parsed.store.unwrap_or(true), &layers)
+        .export_from_template(parsed.base_meme_id, should_store, &layers)
         .await
     {
         Ok(created_id) => (
@@ -347,7 +392,7 @@ async fn admin_logout(State(state): State<AppState>, headers: HeaderMap) -> impl
         state.auth.logout_token(&token);
     }
 
-    let mut response = StatusCode::NO_CONTENT.into_response();
+    let mut response = Redirect::to("/").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_static("imgflop_session=; Max-Age=0; Path=/"),
@@ -446,6 +491,7 @@ async fn admin_shutdown(State(state): State<AppState>, headers: HeaderMap) -> im
 #[derive(Debug, Default, Deserialize)]
 struct CreateExportRequest {
     store: Option<bool>,
+    download: Option<bool>,
     base_meme_id: Option<i64>,
     layers: Option<Vec<CreateLayer>>,
 }
@@ -545,6 +591,8 @@ struct LocalMemeRow {
     id: i64,
     created_at_utc: String,
     output_asset_id: i64,
+    base_title: Option<String>,
+    first_layer_text: Option<String>,
 }
 
 async fn load_gallery_rows(
@@ -582,26 +630,50 @@ async fn load_gallery_rows(
         .collect())
 }
 
-async fn load_local_meme_rows(pool: &SqlitePool) -> Result<Vec<LocalMemeRow>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (i64, String, i64)>(
+async fn load_local_meme_rows(
+    pool: &SqlitePool,
+    search: Option<&str>,
+) -> Result<Vec<LocalMemeRow>, sqlx::Error> {
+    let search_like = search.map(|value| format!("%{}%", value.to_ascii_lowercase()));
+    let rows = sqlx::query_as::<_, (i64, String, i64, Option<String>, Option<String>)>(
         r#"
-        SELECT id, created_at_utc, output_asset_id
-        FROM created_memes
-        WHERE stored = 1
-        ORDER BY id DESC
+        SELECT c.id,
+               c.created_at_utc,
+               c.output_asset_id,
+               base.title,
+               l.layer_text
+        FROM created_memes c
+        LEFT JOIN memes base ON base.id = c.base_meme_id
+        LEFT JOIN created_meme_layers l
+          ON l.created_meme_id = c.id
+         AND l.layer_index = 0
+        WHERE c.stored = 1
+          AND (
+              ? IS NULL
+              OR LOWER(COALESCE(base.title, '')) LIKE ?
+              OR LOWER(COALESCE(l.layer_text, '')) LIKE ?
+          )
+        ORDER BY c.id DESC
         LIMIT 60
         "#,
     )
+    .bind(search_like.as_deref())
+    .bind(search_like.as_deref())
+    .bind(search_like.as_deref())
     .fetch_all(pool)
     .await?;
 
     Ok(rows
         .into_iter()
-        .map(|(id, created_at_utc, output_asset_id)| LocalMemeRow {
-            id,
-            created_at_utc,
-            output_asset_id,
-        })
+        .map(
+            |(id, created_at_utc, output_asset_id, base_title, first_layer_text)| LocalMemeRow {
+                id,
+                created_at_utc,
+                output_asset_id,
+                base_title,
+                first_layer_text,
+            },
+        )
         .collect())
 }
 
@@ -770,7 +842,7 @@ fn render_gallery_html(
 ) -> String {
     let search_value = search.unwrap_or_default();
     let mut html = String::from(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Top Memes</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Top Memes</h1><nav><a href="/create">Create Meme</a> <a href="/admin">Admin</a></nav></header><main><section class="panel"><form class="searchbar" method="get" action="/"><label for="q">Search Top Memes</label><div class="search-controls"><input id="q" type="search" name="q" placeholder="Search by title" value="" /><button type="submit">Search</button><a class="ghost-link" href="/">Clear</a></div></form></section><section><h2>Imgflip Feed</h2><div class="gallery">"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Imgflop - Top Memes</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1><a href="/" class="brand-link">Imgflop - Top Memes</a></h1><nav><a href="/create">Create Meme</a> <a href="/admin">Admin</a></nav></header><main><section class="panel"><form class="searchbar" method="get" action="/"><label for="q">Search Top Memes</label><div class="search-controls"><input id="q" type="search" name="q" placeholder="Search by title" value="" /><button type="submit">Search</button><button type="button" id="clear-search">Clear</button><button type="button" id="back-search">Back</button></div></form></section><section><h2>Imgflip Feed</h2><div class="gallery">"#,
     );
     html = html.replacen(
         "value=\"\"",
@@ -793,7 +865,7 @@ fn render_gallery_html(
                 .image_asset_id
                 .map(|asset_id| {
                     format!(
-                        r#"<img class="thumb" src="/media/image/{asset_id}" alt="{title} preview" loading="lazy"/>"#,
+                        r#"<button type="button" class="thumb-button" data-modal-src="/media/image/{asset_id}" data-modal-title="{title}"><img class="thumb" src="/media/image/{asset_id}" alt="{title} preview" loading="lazy"/></button>"#,
                     )
                 })
                 .unwrap_or_else(|| r#"<div class="thumb placeholder">No Image</div>"#.to_string());
@@ -813,15 +885,20 @@ fn render_gallery_html(
         html.push_str(r#"<article class="card">No local memes yet. Use Create Meme and store an export.</article>"#);
     } else {
         for meme in local_memes {
+            let display_name = local_meme_display_name(meme);
+            let title = escape_html(&display_name);
+            let created_at = render_epoch_time(&meme.created_at_utc, false);
             html.push_str(&format!(
-                r#"<article class="card"><img class="thumb" src="/media/image/{asset_id}" alt="Local meme {id}" loading="lazy"/><h3>Local #{id}</h3><p>Created at {at}</p></article>"#,
+                r#"<article class="card"><button type="button" class="thumb-button" data-modal-src="/media/image/{asset_id}" data-modal-title="{title}"><img class="thumb" src="/media/image/{asset_id}" alt="{title}" loading="lazy"/></button><h3>{title}</h3><p>Created at {created_at}</p></article>"#,
                 asset_id = meme.output_asset_id,
-                id = meme.id,
-                at = escape_html(&meme.created_at_utc),
+                title = title,
+                created_at = created_at,
             ));
         }
     }
-    html.push_str("</div></section></main></body></html>");
+    html.push_str(
+        r##"</div></section><div id="image-modal" class="modal hidden"><div class="modal-backdrop" data-close-modal="true"></div><div class="modal-content"><button type="button" class="modal-close" data-close-modal="true">Close</button><h3 id="modal-title"></h3><img id="modal-image" class="modal-image" alt="Meme preview"/></div></div></main><script>(function(){const form=document.querySelector('form.searchbar');const input=document.getElementById('q');const clearBtn=document.getElementById('clear-search');const backBtn=document.getElementById('back-search');if(clearBtn&&input){clearBtn.addEventListener('click',function(){input.value='';if(form){form.submit();return;}input.focus();});}if(backBtn){backBtn.addEventListener('click',function(){if(window.history.length>1){window.history.back();}else{window.location.href='/';}});}function pad(v){return String(v).padStart(2,'0');}function fmt(epoch,withSeconds){const d=new Date(Number(epoch)*1000);if(Number.isNaN(d.getTime())){return epoch;}const y=d.getFullYear();const m=pad(d.getMonth()+1);const day=pad(d.getDate());const hh=pad(d.getHours());const mm=pad(d.getMinutes());if(withSeconds){return y+'-'+m+'-'+day+' '+hh+':'+mm+':'+pad(d.getSeconds());}return y+'-'+m+'-'+day+' '+hh+':'+mm;}document.querySelectorAll('time[data-epoch]').forEach(function(el){const epoch=el.getAttribute('data-epoch')||el.textContent||'';const withSeconds=el.classList.contains('ts-second');el.textContent=fmt(epoch,withSeconds);});const modal=document.getElementById('image-modal');const modalImg=document.getElementById('modal-image');const modalTitle=document.getElementById('modal-title');function closeModal(){if(modal){modal.classList.add('hidden');}if(modalImg){modalImg.removeAttribute('src');}}document.querySelectorAll('.thumb-button').forEach(function(btn){btn.addEventListener('click',function(){const src=btn.getAttribute('data-modal-src');const title=btn.getAttribute('data-modal-title')||'Preview';if(!src||!modal||!modalImg||!modalTitle){return;}modalImg.setAttribute('src',src);modalTitle.textContent=title;modal.classList.remove('hidden');});});document.querySelectorAll('[data-close-modal="true"]').forEach(function(el){el.addEventListener('click',closeModal);});document.addEventListener('keydown',function(ev){if(ev.key==='Escape'){closeModal();}});})();</script></body></html>"##,
+    );
     html
 }
 
@@ -875,23 +952,25 @@ fn render_missing_detail_html(meme_id: i64) -> String {
 
 fn render_admin_html(runs: &[AdminRunRow], errors: &[AdminErrorRow]) -> String {
     let mut html = String::from(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Admin</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Admin</h1><nav><a href="/">Gallery</a> <a href="/create">Create Meme</a></nav></header><main><section class="panel"><h2>Manual Poll</h2><form method="post" action="/admin/poll"><button type="submit">Run Poll Now</button></form></section><section class="panel"><h2>Upload Template</h2><form method="post" action="/admin/templates/upload" enctype="multipart/form-data" class="create-form"><label>Template Name<input type="text" name="title" maxlength="120" required/></label><label>Image File<input type="file" name="file" accept="image/*" required/></label><button type="submit">Upload Template</button></form></section><section class="panel"><h2>Recent Poll Runs</h2><table><thead><tr><th>ID</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Imgflop - Admin</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><div class="left-actions"><form method="post" action="/admin/logout"><button type="submit">Logout</button></form></div><h1><a href="/" class="brand-link">Imgflop - Admin</a></h1><nav><a href="/">Gallery</a> <a href="/create">Create Meme</a></nav></header><main><section class="panel"><h2>Manual Poll</h2><form method="post" action="/admin/poll"><button type="submit">Run Poll Now</button></form></section><section class="panel"><h2>Upload Template</h2><form method="post" action="/admin/templates/upload" enctype="multipart/form-data" class="create-form narrow-form"><label>Template Name<input type="text" name="title" maxlength="120" required/></label><label>Image File<input type="file" name="file" accept="image/*" required/></label><button type="submit">Upload Template</button></form></section><section class="panel"><h2>Recent Poll Runs</h2><table><thead><tr><th>ID</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>"#,
     );
 
     if runs.is_empty() {
         html.push_str(r#"<tr><td colspan="4">No runs yet.</td></tr>"#);
     } else {
         for run in runs {
+            let started = render_epoch_time(&run.started_at_utc, true);
+            let completed = run
+                .completed_at_utc
+                .as_deref()
+                .map(|value| render_epoch_time(value, true))
+                .unwrap_or_else(|| "-".to_string());
             html.push_str(&format!(
                 r#"<tr><td>{id}</td><td>{status}</td><td>{started}</td><td>{completed}</td></tr>"#,
                 id = run.id,
                 status = escape_html(&run.status),
-                started = escape_html(&run.started_at_utc),
-                completed = run
-                    .completed_at_utc
-                    .as_deref()
-                    .map(escape_html)
-                    .unwrap_or_else(|| "-".to_string())
+                started = started,
+                completed = completed
             ));
         }
     }
@@ -910,7 +989,7 @@ fn render_admin_html(runs: &[AdminRunRow], errors: &[AdminErrorRow]) -> String {
             ));
         }
     }
-    html.push_str(r#"</tbody></table></section><section class="panel admin-actions"><form method="post" action="/admin/logout"><button type="submit">Logout</button></form><form method="post" action="/admin/shutdown" onsubmit="return confirm('Shut down Imgflop server now?');"><button type="submit" class="danger">Shut Down Server</button></form></section></main></body></html>"#);
+    html.push_str(r#"</tbody></table></section><section class="panel admin-actions"><form method="post" action="/admin/shutdown" onsubmit="return confirm('Shut down Imgflop server now?');"><button type="submit" class="danger">Shut Down Server</button></form></section></main><script>(function(){function pad(v){return String(v).padStart(2,'0');}function fmt(epoch){const d=new Date(Number(epoch)*1000);if(Number.isNaN(d.getTime())){return epoch;}return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());}document.querySelectorAll('time.ts-second[data-epoch]').forEach(function(el){const raw=el.getAttribute('data-epoch')||el.textContent||'';el.textContent=fmt(raw);});})();</script></body></html>"#);
     html
 }
 
@@ -964,7 +1043,7 @@ fn render_create_template_picker_html(templates: &[CreateTemplateRow]) -> String
 
 fn render_create_designer_html(template: &CreateTemplateDetail) -> String {
     format!(
-        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Designer</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Designer: {title}</h1><nav><a href="/create">Template Picker</a> <a href="/">Gallery</a> <a href="/admin">Admin</a></nav></header><main class="designer-layout"><section class="panel"><h2>Live Preview</h2><div id="preview-stage" class="preview-stage"><img id="preview-base" src="/media/image/{asset_id}" alt="{title} template"/><div id="overlay-top" class="preview-text">TOP TEXT</div><div id="overlay-bottom" class="preview-text">BOTTOM TEXT</div></div></section><section class="panel"><h2>Layer Editor</h2><form id="designer-form" class="create-form"><input type="hidden" name="base_meme_id" value="{meme_id}"/><label>Top Text<input type="text" name="top_text" value="TOP TEXT" maxlength="120"/></label><label>Bottom Text<input type="text" name="bottom_text" value="BOTTOM TEXT" maxlength="120"/></label><label>Text Scale<input type="range" name="scale" value="4" min="1" max="12"/></label><label>Text Color<input type="color" name="color_hex" value="#ffffff"/></label><label>Top X<input type="number" name="top_x" value="24" min="0" max="3000"/></label><label>Top Y<input type="number" name="top_y" value="24" min="0" max="3000"/></label><label>Bottom X<input type="number" name="bottom_x" value="24" min="0" max="3000"/></label><label>Bottom Y<input type="number" name="bottom_y" value="360" min="0" max="3000"/></label><label class="checkbox-row"><input type="checkbox" name="store" checked/> Store export in local DB</label><button type="submit">Render + Export</button></form><p id="designer-status" class="status"></p></section></main><script>(function(){{const form=document.getElementById('designer-form');const top=document.getElementById('overlay-top');const bottom=document.getElementById('overlay-bottom');const status=document.getElementById('designer-status');function sync(){{const scale=Math.max(1,Number(form.scale.value)||4);const color=form.color_hex.value||'#ffffff';top.textContent=form.top_text.value||'';bottom.textContent=form.bottom_text.value||'';top.style.left=(Number(form.top_x.value)||0)+'px';top.style.top=(Number(form.top_y.value)||0)+'px';bottom.style.left=(Number(form.bottom_x.value)||0)+'px';bottom.style.top=(Number(form.bottom_y.value)||0)+'px';top.style.color=color;bottom.style.color=color;top.style.fontSize=(scale*10)+'px';bottom.style.fontSize=(scale*10)+'px';}}form.addEventListener('input',sync);sync();form.addEventListener('submit',async function(ev){{ev.preventDefault();status.textContent='Rendering...';const scale=Math.max(1,Number(form.scale.value)||4);const color=form.color_hex.value||'#ffffff';const layers=[];if((form.top_text.value||'').trim()){{layers.push({{text:form.top_text.value.trim(),x:Number(form.top_x.value)||24,y:Number(form.top_y.value)||24,scale:scale,color_hex:color}});}}if((form.bottom_text.value||'').trim()){{layers.push({{text:form.bottom_text.value.trim(),x:Number(form.bottom_x.value)||24,y:Number(form.bottom_y.value)||360,scale:scale,color_hex:color}});}}const payload={{store:!!form.store.checked,base_meme_id:Number(form.base_meme_id.value),layers:layers}};try{{const res=await fetch('/create/export',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(payload)}});if(!res.ok){{status.textContent='Export failed ('+res.status+').';return;}}const data=await res.json();if(data.stored&&data.created_id){{status.textContent='Stored local meme #'+data.created_id;}}else{{status.textContent='Rendered export (not stored).';}}}}catch(_err){{status.textContent='Network error while exporting.';}}}});}})();</script></body></html>"##,
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Designer</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Designer: {title}</h1><nav><a href="/create">Template Picker</a> <a href="/">Gallery</a> <a href="/admin">Admin</a></nav></header><main class="designer-layout"><section class="panel"><h2>Live Preview</h2><div id="preview-stage" class="preview-stage"><img id="preview-base" src="/media/image/{asset_id}" alt="{title} template"/><div id="overlay-top" class="preview-text">TOP TEXT</div><div id="overlay-bottom" class="preview-text">BOTTOM TEXT</div></div></section><section class="panel"><h2>Layer Editor</h2><form id="designer-form" class="create-form"><input type="hidden" name="base_meme_id" value="{meme_id}"/><label>Top Text<input type="text" name="top_text" value="TOP TEXT" maxlength="120"/></label><label>Bottom Text<input type="text" name="bottom_text" value="BOTTOM TEXT" maxlength="120"/></label><label>Text Scale<input type="range" name="scale" value="4" min="1" max="12"/></label><label>Text Color<input type="color" name="color_hex" value="#ffffff"/></label><label>Top X<input type="number" name="top_x" value="24" min="0" max="3000"/></label><label>Top Y<input type="number" name="top_y" value="24" min="0" max="3000"/></label><label>Bottom X<input type="number" name="bottom_x" value="24" min="0" max="3000"/></label><label>Bottom Y<input type="number" name="bottom_y" value="360" min="0" max="3000"/></label><label class="checkbox-row"><input type="checkbox" name="store" checked/> Store in Imgflop</label><button type="submit">Render + Export</button></form><p id="designer-status" class="status"></p></section></main><script>(function(){{const form=document.getElementById('designer-form');const top=document.getElementById('overlay-top');const bottom=document.getElementById('overlay-bottom');const status=document.getElementById('designer-status');function sync(){{const scale=Math.max(1,Number(form.scale.value)||4);const color=form.color_hex.value||'#ffffff';top.textContent=form.top_text.value||'';bottom.textContent=form.bottom_text.value||'';top.style.left=(Number(form.top_x.value)||0)+'px';top.style.top=(Number(form.top_y.value)||0)+'px';bottom.style.left=(Number(form.bottom_x.value)||0)+'px';bottom.style.top=(Number(form.bottom_y.value)||0)+'px';top.style.color=color;bottom.style.color=color;top.style.fontSize=(scale*10)+'px';bottom.style.fontSize=(scale*10)+'px';}}form.addEventListener('input',sync);sync();form.addEventListener('submit',async function(ev){{ev.preventDefault();status.textContent='Rendering...';const scale=Math.max(1,Number(form.scale.value)||4);const color=form.color_hex.value||'#ffffff';const layers=[];if((form.top_text.value||'').trim()){{layers.push({{text:form.top_text.value.trim(),x:Number(form.top_x.value)||24,y:Number(form.top_y.value)||24,scale:scale,color_hex:color}});}}if((form.bottom_text.value||'').trim()){{layers.push({{text:form.bottom_text.value.trim(),x:Number(form.bottom_x.value)||24,y:Number(form.bottom_y.value)||360,scale:scale,color_hex:color}});}}const payload={{store:!!form.store.checked,download:true,base_meme_id:Number(form.base_meme_id.value),layers:layers}};try{{const res=await fetch('/create/export',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(payload)}});if(!res.ok){{status.textContent='Export failed ('+res.status+').';return;}}const blob=await res.blob();if(!blob||blob.size===0){{status.textContent='Export failed (empty image).';return;}}const url=window.URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download='imgflop-export.png';document.body.appendChild(link);link.click();link.remove();window.setTimeout(function(){{window.URL.revokeObjectURL(url);}},1000);const createdId=res.headers.get('x-imgflop-created-id');if(form.store.checked&&createdId){{status.textContent='Exported PNG and stored meme #'+createdId+'.';}}else if(form.store.checked){{status.textContent='Exported PNG and stored in Imgflop.';}}else{{status.textContent='Exported PNG download.';}}}}catch(_err){{status.textContent='Network error while exporting.';}}}});}})();</script></body></html>"##,
         title = escape_html(&template.title),
         asset_id = template.image_asset_id,
         meme_id = template.meme_id
@@ -976,8 +1055,58 @@ fn render_admin_login_html(error: Option<&str>) -> String {
         .map(|value| format!(r#"<p class="status error">{}</p>"#, escape_html(value)))
         .unwrap_or_default();
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Admin Login</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Admin Login</h1><nav><a href="/">Gallery</a> <a href="/create">Create Meme</a></nav></header><main><section class="panel"><h2>Sign In</h2>{error_html}<form method="post" action="/admin/login" class="create-form"><label>Username<input type="text" name="username" required/></label><label>Password<input type="password" name="password" required/></label><button type="submit">Login</button></form></section></main></body></html>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Admin Login</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Admin Login</h1><nav><a href="/">Gallery</a> <a href="/create">Create Meme</a></nav></header><main><section class="panel auth-panel"><h2>Sign In</h2>{error_html}<form method="post" action="/admin/login" class="create-form narrow-form"><label>Username<input type="text" name="username" required/></label><label>Password<input type="password" name="password" required/></label><button type="submit">Login</button></form></section></main></body></html>"#,
     )
+}
+
+fn local_meme_display_name(meme: &LocalMemeRow) -> String {
+    let base = meme
+        .base_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let first = meme
+        .first_layer_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (base, first) {
+        (Some(base), Some(first)) => format!("{base}: {}", truncate_label(first, 48)),
+        (Some(base), None) => base.to_string(),
+        (None, Some(first)) => format!("Local Meme: {}", truncate_label(first, 48)),
+        (None, None) => format!("Local Meme #{}", meme.id),
+    }
+}
+
+fn truncate_label(input: &str, max_chars: usize) -> String {
+    let count = input.chars().count();
+    if count <= max_chars {
+        return input.to_string();
+    }
+    let mut out = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx >= max_chars.saturating_sub(3) {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn render_epoch_time(epoch: &str, with_seconds: bool) -> String {
+    if epoch.parse::<i64>().is_ok() {
+        let class = if with_seconds {
+            "ts-second"
+        } else {
+            "ts-minute"
+        };
+        let escaped = escape_html(epoch);
+        return format!(r#"<time class="{class}" data-epoch="{escaped}">{escaped}</time>"#);
+    }
+
+    escape_html(epoch)
 }
 
 fn parse_hex_color(input: &str) -> Option<[u8; 4]> {

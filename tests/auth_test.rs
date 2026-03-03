@@ -70,3 +70,66 @@ async fn browser_login_form_returns_session_cookie() {
     );
     assert!(login.headers().get(header::SET_COOKIE).is_some());
 }
+
+#[tokio::test]
+async fn browser_logout_redirects_home_and_invalidates_session() {
+    let app = imgflop::web::app_router();
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("username=admin&password=admin"))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    let cookie = login
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("session cookie should exist")
+        .to_string();
+
+    let logout = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/logout")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        logout
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/")
+    );
+
+    let admin = app
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(admin.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        admin
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/admin/login")
+    );
+}
