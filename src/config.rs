@@ -7,6 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use argon2::password_hash::PasswordHash;
 use serde::Deserialize;
 use sqlx::sqlite::SqliteConnectOptions;
 
@@ -35,8 +36,8 @@ pub struct Config {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeAuthConfig {
-    pub admin_user: String,
-    pub admin_password_hash: String,
+    pub fallback_admin_user: Option<String>,
+    pub fallback_admin_password_hash: Option<String>,
     pub session_ttl_secs: u64,
     pub secure_cookie: bool,
 }
@@ -76,12 +77,16 @@ impl RuntimeConfig {
             300,
         )?;
 
-        let admin_user = get("ADMIN_USER")
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| "ADMIN_USER must be set".to_string())?;
-        let admin_password_hash = get("ADMIN_PASSWORD_HASH")
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| "ADMIN_PASSWORD_HASH must be set".to_string())?;
+        let fallback_admin_user = get("ADMIN_USER").filter(|value| !value.trim().is_empty());
+        let fallback_admin_password_hash =
+            get("ADMIN_PASSWORD_HASH").filter(|value| !value.trim().is_empty());
+        if fallback_admin_user.is_some() != fallback_admin_password_hash.is_some() {
+            return Err("ADMIN_USER and ADMIN_PASSWORD_HASH must both be set".to_string());
+        }
+        if let Some(hash) = fallback_admin_password_hash.as_deref() {
+            PasswordHash::new(hash)
+                .map_err(|_| "ADMIN_PASSWORD_HASH must be a valid argon2 hash".to_string())?;
+        }
 
         let session_ttl_secs = parse_u64_at_least_one(
             get("IMGFLOP_SESSION_TTL_SECS"),
@@ -103,8 +108,8 @@ impl RuntimeConfig {
             poll_interval_secs,
             api_endpoint,
             auth: RuntimeAuthConfig {
-                admin_user,
-                admin_password_hash,
+                fallback_admin_user,
+                fallback_admin_password_hash,
                 session_ttl_secs,
                 secure_cookie,
             },

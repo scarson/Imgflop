@@ -1,5 +1,10 @@
 use std::collections::HashMap;
 
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, SaltString},
+};
+
 #[test]
 fn parses_api_max_and_history_top_n() {
     let cfg = imgflop::config::from_toml(
@@ -16,11 +21,21 @@ history_top_n = 2000
 }
 
 #[test]
-fn runtime_config_requires_admin_env() {
+fn runtime_config_allows_missing_admin_env() {
     let map = HashMap::new();
-    let err =
-        imgflop::config::RuntimeConfig::from_map(&map).expect_err("missing admin env should fail");
-    assert!(err.contains("ADMIN_USER"));
+    let cfg = imgflop::config::RuntimeConfig::from_map(&map)
+        .expect("missing admin env should allow db-backed setup");
+    assert!(cfg.auth.fallback_admin_user.is_none());
+    assert!(cfg.auth.fallback_admin_password_hash.is_none());
+}
+
+#[test]
+fn runtime_config_rejects_partial_admin_fallback_env() {
+    let mut map = HashMap::new();
+    map.insert("ADMIN_USER".to_string(), "admin".to_string());
+    let err = imgflop::config::RuntimeConfig::from_map(&map)
+        .expect_err("partial admin fallback env should fail");
+    assert!(err.contains("must both be set"));
 }
 
 #[test]
@@ -36,6 +51,8 @@ fn runtime_config_parses_auth_and_polling_overrides() {
     assert_eq!(cfg.poll_interval_secs, 30);
     assert_eq!(cfg.auth.session_ttl_secs, 7200);
     assert!(cfg.auth.secure_cookie);
+    assert_eq!(cfg.auth.fallback_admin_user.as_deref(), Some("admin"));
+    assert!(cfg.auth.fallback_admin_password_hash.is_some());
 }
 
 #[test]
@@ -132,10 +149,12 @@ fn runtime_config_validate_startup_rejects_invalid_db_url() {
 
 fn base_runtime_map() -> HashMap<String, String> {
     let mut map = HashMap::new();
+    let salt = SaltString::encode_b64(b"fixedsaltfixed12").expect("test salt should encode");
+    let password_hash = Argon2::default()
+        .hash_password(b"admin", &salt)
+        .expect("password hash should build")
+        .to_string();
     map.insert("ADMIN_USER".to_string(), "admin".to_string());
-    map.insert(
-        "ADMIN_PASSWORD_HASH".to_string(),
-        "$argon2id$dummy".to_string(),
-    );
+    map.insert("ADMIN_PASSWORD_HASH".to_string(), password_hash);
     map
 }

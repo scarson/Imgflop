@@ -40,9 +40,9 @@ async fn main() {
     ));
     let designer = DesignerService::new(pool.clone(), assets_root);
     let auth = Arc::new(
-        AuthService::new(
-            config.auth.admin_user.clone(),
-            config.auth.admin_password_hash.clone(),
+        AuthService::new_with_fallback(
+            config.auth.fallback_admin_user.clone(),
+            config.auth.fallback_admin_password_hash.clone(),
             config.auth.session_ttl_secs,
             config.auth.secure_cookie,
         )

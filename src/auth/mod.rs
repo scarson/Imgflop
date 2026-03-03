@@ -22,12 +22,17 @@ pub enum AuthError {
 }
 
 pub struct AuthService {
-    admin_user: String,
-    admin_password_hash: String,
+    fallback_admin: Option<FallbackAdmin>,
     sessions: Mutex<HashSet<SessionRecord>>,
     session_seq: AtomicU64,
     session_ttl_secs: u64,
     secure_cookie: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FallbackAdmin {
+    username: String,
+    password_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -43,18 +48,42 @@ impl AuthService {
         session_ttl_secs: u64,
         secure_cookie: bool,
     ) -> Result<Self, String> {
-        if admin_user.trim().is_empty() {
-            return Err("admin username must not be empty".to_string());
-        }
-        PasswordHash::new(&admin_password_hash)
-            .map_err(|_| "admin password hash is invalid".to_string())?;
+        Self::new_with_fallback(
+            Some(admin_user),
+            Some(admin_password_hash),
+            session_ttl_secs,
+            secure_cookie,
+        )
+    }
+
+    pub fn new_with_fallback(
+        admin_user: Option<String>,
+        admin_password_hash: Option<String>,
+        session_ttl_secs: u64,
+        secure_cookie: bool,
+    ) -> Result<Self, String> {
         if session_ttl_secs == 0 {
             return Err("session TTL must be >= 1 second".to_string());
         }
 
+        let fallback_admin = match (admin_user, admin_password_hash) {
+            (Some(username), Some(password_hash)) => {
+                if username.trim().is_empty() {
+                    return Err("admin username must not be empty".to_string());
+                }
+                PasswordHash::new(&password_hash)
+                    .map_err(|_| "admin password hash is invalid".to_string())?;
+                Some(FallbackAdmin {
+                    username,
+                    password_hash,
+                })
+            }
+            (None, None) => None,
+            _ => return Err("ADMIN_USER and ADMIN_PASSWORD_HASH must both be set".to_string()),
+        };
+
         Ok(Self {
-            admin_user,
-            admin_password_hash,
+            fallback_admin,
             sessions: Mutex::new(HashSet::new()),
             session_seq: AtomicU64::new(1),
             session_ttl_secs,
@@ -63,30 +92,18 @@ impl AuthService {
     }
 
     pub fn dev_default() -> Self {
-        let salt = SaltString::generate(&mut OsRng);
-        let password_hash = Argon2::default()
-            .hash_password(b"admin", &salt)
-            .expect("default dev password hash should build")
-            .to_string();
+        let password_hash = hash_password("admin").expect("default dev password hash should build");
 
-        Self::new("admin".to_string(), password_hash, 3600, false)
+        Self::new_with_fallback(Some("admin".to_string()), Some(password_hash), 3600, false)
             .expect("dev default auth should be valid")
     }
 
     pub fn login(&self, username: &str, password: &str) -> Result<String, AuthError> {
-        if !self.verify_credentials(username, password) {
+        if !self.verify_fallback_credentials(username, password) {
             return Err(AuthError::InvalidCredentials);
         }
 
-        let token = format!("s-{}", self.session_seq.fetch_add(1, Ordering::Relaxed));
-        let issued_at_utc = now_epoch_seconds();
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.insert(SessionRecord {
-                token: token.clone(),
-                issued_at_utc,
-            });
-        }
-        Ok(token)
+        Ok(self.issue_session_token())
     }
 
     pub fn logout_token(&self, token: &str) {
@@ -118,18 +135,30 @@ impl AuthService {
         self.secure_cookie
     }
 
-    fn verify_credentials(&self, username: &str, password: &str) -> bool {
-        if username != self.admin_user {
-            return false;
-        }
+    pub fn has_fallback_credentials(&self) -> bool {
+        self.fallback_admin.is_some()
+    }
 
-        let Ok(parsed_hash) = PasswordHash::new(&self.admin_password_hash) else {
+    pub fn issue_session_token(&self) -> String {
+        let token = format!("s-{}", self.session_seq.fetch_add(1, Ordering::Relaxed));
+        let issued_at_utc = now_epoch_seconds();
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.insert(SessionRecord {
+                token: token.clone(),
+                issued_at_utc,
+            });
+        }
+        token
+    }
+
+    pub fn verify_fallback_credentials(&self, username: &str, password: &str) -> bool {
+        let Some(fallback) = self.fallback_admin.as_ref() else {
             return false;
         };
-
-        Argon2::default()
-            .verify_password(password.as_bytes(), &parsed_hash)
-            .is_ok()
+        if username != fallback.username {
+            return false;
+        }
+        verify_password(&fallback.password_hash, password)
     }
 
     fn is_expired(&self, now_utc: i64, issued_at_utc: i64) -> bool {
@@ -142,4 +171,24 @@ fn now_epoch_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+pub fn hash_password(password: &str) -> Result<String, String> {
+    if password.is_empty() {
+        return Err("password must not be empty".to_string());
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|err| err.to_string())
+}
+
+pub fn verify_password(password_hash: &str, password: &str) -> bool {
+    let Ok(parsed_hash) = PasswordHash::new(password_hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .is_ok()
 }

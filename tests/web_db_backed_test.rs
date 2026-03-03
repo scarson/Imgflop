@@ -452,7 +452,146 @@ async fn media_route_serves_local_asset_bytes() {
     );
 }
 
+#[tokio::test]
+async fn admin_first_run_setup_creates_db_credential_and_allows_login() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let app = runtime_app_with_auth(
+        pool.clone(),
+        temp.path().to_path_buf(),
+        Arc::new(
+            AuthService::new_with_fallback(None, None, 3600, false)
+                .expect("no-fallback auth should build"),
+        ),
+    )
+    .await;
+
+    let login_page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/login")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(login_page.status(), StatusCode::OK);
+    let page = login_page
+        .into_body()
+        .collect()
+        .await
+        .expect("body should read")
+        .to_bytes();
+    let page_text = String::from_utf8_lossy(&page);
+    assert!(page_text.contains("Create Admin Account"));
+
+    let setup_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "mode=setup&username=owner&password=secret123&confirm_password=secret123",
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(setup_response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        setup_response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/admin")
+    );
+
+    let stored_user: Option<String> =
+        sqlx::query_scalar("SELECT username FROM admin_credentials WHERE id = 1")
+            .fetch_optional(&pool)
+            .await
+            .expect("admin credentials should query");
+    assert_eq!(stored_user.as_deref(), Some("owner"));
+
+    let login = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"username":"owner","password":"secret123"}).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(login.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn admin_login_accepts_fallback_even_when_db_admin_exists() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let db_hash = imgflop::auth::hash_password("ownerpass").expect("hash should build");
+    sqlx::query(
+        "INSERT INTO admin_credentials (id, username, password_hash, created_at_utc, updated_at_utc) VALUES (1, ?, ?, ?, ?)",
+    )
+    .bind("owner")
+    .bind(&db_hash)
+    .bind(now_epoch_seconds().to_string())
+    .bind(now_epoch_seconds().to_string())
+    .execute(&pool)
+    .await
+    .expect("admin credential should insert");
+
+    let app = runtime_app(pool.clone(), temp.path().to_path_buf()).await;
+
+    let fallback_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"username":"admin","password":"admin"}).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(fallback_login.status(), StatusCode::NO_CONTENT);
+
+    let db_login = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"username":"owner","password":"ownerpass"}).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(db_login.status(), StatusCode::NO_CONTENT);
+}
+
 async fn runtime_app(pool: sqlx::SqlitePool, assets_dir: std::path::PathBuf) -> axum::Router {
+    let auth = Arc::new(AuthService::dev_default());
+    runtime_app_with_auth(pool, assets_dir, auth).await
+}
+
+async fn runtime_app_with_auth(
+    pool: sqlx::SqlitePool,
+    assets_dir: std::path::PathBuf,
+    auth: Arc<AuthService>,
+) -> axum::Router {
     let scheduler = Arc::new(Scheduler::new());
     let poll_runtime = Arc::new(PollRuntime::new(
         pool.clone(),
@@ -460,7 +599,6 @@ async fn runtime_app(pool: sqlx::SqlitePool, assets_dir: std::path::PathBuf) -> 
         10,
         Some("http://127.0.0.1:9/get_memes".to_string()),
     ));
-    let auth = Arc::new(AuthService::dev_default());
     let designer = DesignerService::new(pool.clone(), assets_dir);
     web::app_router_runtime(scheduler, poll_runtime, auth, pool, designer)
 }

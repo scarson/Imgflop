@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
@@ -13,7 +16,7 @@ use sqlx::SqlitePool;
 use tokio::sync::watch;
 
 use crate::{
-    auth::{AuthService, session::extract_session_token},
+    auth::{AuthService, hash_password, session::extract_session_token, verify_password},
     designer::{DesignerService, render::TextLayer},
     ops::{
         polling::{PollRuntime, trigger_and_spawn},
@@ -301,8 +304,13 @@ async fn logo_image() -> ([(&'static str, &'static str); 1], &'static [u8]) {
     )
 }
 
-async fn admin_login_page() -> Html<String> {
-    Html(render_admin_login_html(None))
+async fn admin_login_page(State(state): State<AppState>) -> Html<String> {
+    let setup_mode = login_page_should_show_setup(&state).await;
+    Html(render_admin_login_html(
+        None,
+        setup_mode,
+        state.auth.has_fallback_credentials(),
+    ))
 }
 
 async fn admin_home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -327,6 +335,8 @@ async fn admin_home(State(state): State<AppState>, headers: HeaderMap) -> impl I
 struct LoginRequest {
     username: String,
     password: String,
+    mode: Option<String>,
+    confirm_password: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -347,42 +357,179 @@ async fn admin_login(
             return if expects_json {
                 StatusCode::BAD_REQUEST.into_response()
             } else {
-                Html(render_admin_login_html(Some("Invalid login payload"))).into_response()
+                let setup_mode = login_page_should_show_setup(&state).await;
+                Html(render_admin_login_html(
+                    Some("Invalid login payload"),
+                    setup_mode,
+                    state.auth.has_fallback_credentials(),
+                ))
+                .into_response()
             };
         }
     };
 
-    match state.auth.login(&payload.username, &payload.password) {
-        Ok(token) => {
-            let mut cookie = format!(
-                "imgflop_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
-                state.auth.session_ttl_secs()
-            );
-            if state.auth.secure_cookie() {
-                cookie.push_str("; Secure");
+    let username = payload.username.trim();
+    let password = payload.password;
+    if username.is_empty() || password.is_empty() {
+        return login_error_response(
+            expects_json,
+            &state,
+            "Username and password are required",
+            StatusCode::BAD_REQUEST,
+            state.pool.is_some(),
+        )
+        .await;
+    }
+
+    let mode = LoginMode::from_payload(payload.mode.as_deref());
+    let db_credential = if let Some(pool) = state.pool.as_ref() {
+        match load_admin_credential(pool).await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to load admin credential");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-            let mut response = StatusCode::NO_CONTENT.into_response();
-            response.headers_mut().insert(
-                header::SET_COOKIE,
-                HeaderValue::from_str(&cookie).expect("cookie should be valid"),
-            );
-            if !expects_json {
-                *response.status_mut() = StatusCode::SEE_OTHER;
-                response
-                    .headers_mut()
-                    .insert(header::LOCATION, HeaderValue::from_static("/admin"));
-            }
-            response
         }
-        Err(_) => {
-            if expects_json {
-                StatusCode::UNAUTHORIZED.into_response()
-            } else {
-                Html(render_admin_login_html(Some(
-                    "Invalid username or password",
-                )))
-                .into_response()
+    } else {
+        None
+    };
+    let setup_mode = db_credential.is_none() && state.pool.is_some();
+
+    if setup_mode && matches!(mode, LoginMode::Setup) {
+        let confirm_password = payload.confirm_password.unwrap_or_default();
+        if password != confirm_password {
+            return login_error_response(
+                expects_json,
+                &state,
+                "Password confirmation does not match",
+                StatusCode::BAD_REQUEST,
+                true,
+            )
+            .await;
+        }
+        if password.chars().count() < 8 {
+            return login_error_response(
+                expects_json,
+                &state,
+                "Password must be at least 8 characters",
+                StatusCode::BAD_REQUEST,
+                true,
+            )
+            .await;
+        }
+        let Some(pool) = state.pool.as_ref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let password_hash = match hash_password(&password) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to hash setup password");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
+        };
+        if let Err(err) = create_admin_credential(pool, username, &password_hash).await {
+            tracing::error!(error = %err, "failed to create admin credential");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let token = state.auth.issue_session_token();
+        return login_success_response(&state.auth, token, expects_json);
+    }
+
+    let db_authenticated = db_credential
+        .as_ref()
+        .map(|credential| {
+            credential.username == username && verify_password(&credential.password_hash, &password)
+        })
+        .unwrap_or(false);
+    let fallback_authenticated = state.auth.verify_fallback_credentials(username, &password);
+
+    if db_authenticated || fallback_authenticated {
+        let token = state.auth.issue_session_token();
+        login_success_response(&state.auth, token, expects_json)
+    } else {
+        let status = if setup_mode {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        let message = if setup_mode {
+            "Create the first admin account to sign in"
+        } else {
+            "Invalid username or password"
+        };
+        login_error_response(expects_json, &state, message, status, setup_mode).await
+    }
+}
+
+async fn login_error_response(
+    expects_json: bool,
+    state: &AppState,
+    message: &str,
+    status: StatusCode,
+    setup_mode: bool,
+) -> axum::response::Response {
+    if expects_json {
+        return status.into_response();
+    }
+
+    Html(render_admin_login_html(
+        Some(message),
+        setup_mode,
+        state.auth.has_fallback_credentials(),
+    ))
+    .into_response()
+}
+
+fn login_success_response(
+    auth: &AuthService,
+    token: String,
+    expects_json: bool,
+) -> axum::response::Response {
+    let mut cookie = format!(
+        "imgflop_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+        auth.session_ttl_secs()
+    );
+    if auth.secure_cookie() {
+        cookie.push_str("; Secure");
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("cookie should be valid"),
+    );
+    if !expects_json {
+        *response.status_mut() = StatusCode::SEE_OTHER;
+        response
+            .headers_mut()
+            .insert(header::LOCATION, HeaderValue::from_static("/admin"));
+    }
+    response
+}
+
+async fn login_page_should_show_setup(state: &AppState) -> bool {
+    let Some(pool) = state.pool.as_ref() else {
+        return false;
+    };
+    match load_admin_credential(pool).await {
+        Ok(value) => value.is_none(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load admin credential");
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginMode {
+    Login,
+    Setup,
+}
+
+impl LoginMode {
+    fn from_payload(value: Option<&str>) -> Self {
+        match value {
+            Some("setup") => Self::Setup,
+            _ => Self::Login,
         }
     }
 }
@@ -595,6 +742,12 @@ struct LocalMemeRow {
     first_layer_text: Option<String>,
 }
 
+#[derive(Debug)]
+struct AdminCredential {
+    username: String,
+    password_hash: String,
+}
+
 async fn load_gallery_rows(
     pool: &SqlitePool,
     search: Option<&str>,
@@ -766,6 +919,44 @@ async fn load_admin_rows(
     .collect();
 
     Ok((runs, errors))
+}
+
+async fn load_admin_credential(pool: &SqlitePool) -> Result<Option<AdminCredential>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT username, password_hash FROM admin_credentials WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(username, password_hash)| AdminCredential {
+        username,
+        password_hash,
+    }))
+}
+
+async fn create_admin_credential(
+    pool: &SqlitePool,
+    username: &str,
+    password_hash: &str,
+) -> Result<(), sqlx::Error> {
+    let now = now_epoch_seconds().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO admin_credentials (id, username, password_hash, created_at_utc, updated_at_utc)
+        VALUES (1, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE
+        SET username = excluded.username,
+            password_hash = excluded.password_hash,
+            updated_at_utc = excluded.updated_at_utc
+        "#,
+    )
+    .bind(username)
+    .bind(password_hash)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 async fn load_create_templates(pool: &SqlitePool) -> Result<Vec<CreateTemplateRow>, sqlx::Error> {
@@ -1050,13 +1241,41 @@ fn render_create_designer_html(template: &CreateTemplateDetail) -> String {
     )
 }
 
-fn render_admin_login_html(error: Option<&str>) -> String {
+fn render_admin_login_html(
+    error: Option<&str>,
+    setup_mode: bool,
+    fallback_available: bool,
+) -> String {
     let error_html = error
         .map(|value| format!(r#"<p class="status error">{}</p>"#, escape_html(value)))
         .unwrap_or_default();
-    format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Admin Login</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Admin Login</h1><nav><a href="/">Gallery</a> <a href="/create">Create Meme</a></nav></header><main><section class="panel auth-panel"><h2>Sign In</h2>{error_html}<form method="post" action="/admin/login" class="create-form narrow-form"><label>Username<input type="text" name="username" required/></label><label>Password<input type="password" name="password" required/></label><button type="submit">Login</button></form></section></main></body></html>"#,
-    )
+    let mut html = String::from(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Admin Login</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Admin Login</h1><nav><a href="/">Gallery</a> <a href="/create">Create Meme</a></nav></header><main><section class="panel auth-panel">"#,
+    );
+    if setup_mode {
+        html.push_str("<h2>Create Admin Account</h2>");
+    } else {
+        html.push_str("<h2>Sign In</h2>");
+    }
+    html.push_str(&error_html);
+
+    if setup_mode {
+        html.push_str(
+            r#"<form method="post" action="/admin/login" class="create-form narrow-form"><input type="hidden" name="mode" value="setup"/><label>Username<input type="text" name="username" required/></label><label>Password<input type="password" name="password" minlength="8" required/></label><label>Confirm Password<input type="password" name="confirm_password" minlength="8" required/></label><button type="submit">Create Admin Account</button></form><p class="status">First-time setup stores credentials locally in SQLite with Argon2id hashing.</p>"#,
+        );
+        if fallback_available {
+            html.push_str(
+                r#"<hr/><h3>Fallback Login</h3><form method="post" action="/admin/login" class="create-form narrow-form"><input type="hidden" name="mode" value="login"/><label>Username<input type="text" name="username" required/></label><label>Password<input type="password" name="password" required/></label><button type="submit">Login with Fallback</button></form>"#,
+            );
+        }
+    } else {
+        html.push_str(
+            r#"<form method="post" action="/admin/login" class="create-form narrow-form"><input type="hidden" name="mode" value="login"/><label>Username<input type="text" name="username" required/></label><label>Password<input type="password" name="password" required/></label><button type="submit">Login</button></form>"#,
+        );
+    }
+
+    html.push_str("</section></main></body></html>");
+    html
 }
 
 fn local_meme_display_name(meme: &LocalMemeRow) -> String {
@@ -1107,6 +1326,13 @@ fn render_epoch_time(epoch: &str, with_seconds: bool) -> String {
     }
 
     escape_html(epoch)
+}
+
+fn now_epoch_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 fn parse_hex_color(input: &str) -> Option<[u8; 4]> {

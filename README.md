@@ -97,8 +97,8 @@ stdout = true
 
 ### Runtime Environment
 
-- `ADMIN_USER` (required)
-- `ADMIN_PASSWORD_HASH` (required)
+- `ADMIN_USER` (optional fallback login)
+- `ADMIN_PASSWORD_HASH` (optional fallback login, requires `ADMIN_USER`)
 - `IMGFLOP_API_TOP_N` (`max` by default, or integer `>= 1`)
 - `IMGFLOP_HISTORY_TOP_N` (`100` by default, integer `>= 1`)
 - `IMGFLOP_POLL_INTERVAL_SECS` (`300` by default, integer `>= 1`)
@@ -110,6 +110,11 @@ stdout = true
 `IMGFLOP_API_TOP_N` and `IMGFLOP_HISTORY_TOP_N` are independent:
 - API ingest candidate count is controlled by `IMGFLOP_API_TOP_N`.
 - Persisted top-state/events are controlled by `IMGFLOP_HISTORY_TOP_N`.
+
+Admin auth behavior:
+- If no admin account exists in DB, `/admin/login` shows a first-run setup form.
+- Setup stores one local admin credential in SQLite using Argon2id hash.
+- If `ADMIN_USER` + `ADMIN_PASSWORD_HASH` are provided, they remain usable as an emergency fallback login.
 
 ### Prerequisites
 - Rust toolchain (stable)
