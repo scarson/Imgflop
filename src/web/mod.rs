@@ -37,6 +37,8 @@ pub fn app_router_with_scheduler(scheduler: Arc<Scheduler>) -> Router {
 fn app_router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(gallery_page))
+        .route("/create", get(create_page))
+        .route("/create/export", post(create_export))
         .route("/health", get(|| async { "ok" }))
         .route("/static/app.css", get(stylesheet))
         .route("/admin", get(admin_home))
@@ -48,6 +50,14 @@ fn app_router_with_state(state: AppState) -> Router {
 
 async fn gallery_page() -> Html<&'static str> {
     Html(routes::gallery::render())
+}
+
+async fn create_page() -> Html<&'static str> {
+    Html(routes::create::render())
+}
+
+async fn create_export() -> StatusCode {
+    StatusCode::OK
 }
 
 async fn stylesheet() -> ([(&'static str, &'static str); 1], &'static str) {

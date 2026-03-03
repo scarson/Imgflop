@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod assets;
 pub mod config;
+pub mod designer;
 pub mod diff;
 pub mod ingest;
 pub mod ops;
