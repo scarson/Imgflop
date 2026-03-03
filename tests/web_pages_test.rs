@@ -1,0 +1,20 @@
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use http_body_util::BodyExt;
+use tower::ServiceExt;
+
+#[tokio::test]
+async fn gallery_page_renders_ranked_memes() {
+    let app = imgflop::web::app_router();
+    let res = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .expect("request should complete");
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let page = String::from_utf8_lossy(&body);
+    assert!(page.contains("Top Memes"));
+}

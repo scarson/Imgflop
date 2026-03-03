@@ -1,0 +1,30 @@
+:root {
+  --bg: #f5f5ef;
+  --text: #222222;
+  --card: #ffffff;
+  --accent: #0f766e;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+  background: linear-gradient(160deg, #f5f5ef 0%, #e8ecef 100%);
+  color: var(--text);
+}
+
+.topbar {
+  padding: 1rem 1.25rem;
+  border-bottom: 2px solid #d5d9dd;
+  background: #ffffffcc;
+}
+
+.gallery {
+  padding: 1rem 1.25rem;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid #d5d9dd;
+  border-radius: 10px;
+  padding: 1rem;
+}

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     extract::State,
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::{get, post},
     Json,
     Router,
@@ -14,6 +14,8 @@ use crate::{
     auth::{session::extract_session_token, AuthService},
     ops::scheduler::Scheduler,
 };
+
+pub mod routes;
 
 #[derive(Clone)]
 struct AppState {
@@ -34,7 +36,9 @@ pub fn app_router_with_scheduler(scheduler: Arc<Scheduler>) -> Router {
 
 fn app_router_with_state(state: AppState) -> Router {
     Router::new()
+        .route("/", get(gallery_page))
         .route("/health", get(|| async { "ok" }))
+        .route("/static/app.css", get(stylesheet))
         .route("/admin", get(admin_home))
         .route("/admin/login", post(admin_login))
         .route("/admin/logout", post(admin_logout))
@@ -42,11 +46,19 @@ fn app_router_with_state(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn admin_home(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
+async fn gallery_page() -> Html<&'static str> {
+    Html(routes::gallery::render())
+}
+
+async fn stylesheet() -> ([(&'static str, &'static str); 1], &'static str) {
+    ([("content-type", "text/css; charset=utf-8")], include_str!("static/app.css"))
+}
+
+async fn admin_home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if state.auth.is_authenticated_headers(&headers) {
-        StatusCode::OK
+        Html(routes::admin::render()).into_response()
     } else {
-        StatusCode::UNAUTHORIZED
+        StatusCode::UNAUTHORIZED.into_response()
     }
 }
 
