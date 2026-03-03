@@ -24,6 +24,10 @@ Build a robust local Imgflip clone as a single Rust binary that:
 - History write policy: change-only events, never full duplicate snapshots.
 - Source strategy: API authoritative for rank list length; scraper optional enrichment/fallback.
 
+API reference:
+- Official Imgflip API docs: https://imgflip.com/api
+- Primary ingest endpoint: `https://api.imgflip.com/get_memes`
+
 ## 3. Non-Goals (V1)
 
 - Multi-user auth/RBAC/SSO.

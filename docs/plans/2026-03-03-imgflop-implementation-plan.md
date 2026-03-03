@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust, axum, tokio, sqlx (SQLite), reqwest, scraper, askama, htmx/alpine, tracing, argon2, cargo-llvm-cov.
 
+**External Reference (Required):** Official Imgflip API docs at https://imgflip.com/api. Use these docs as the source of truth for payload shape and endpoint behavior when updating `sources::api`.
+
 ---
 
 ### Task 1: Project Bootstrap and Health Endpoint
