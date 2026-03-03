@@ -2,6 +2,38 @@ use serde::Deserialize;
 
 use crate::sources::MemeCandidate;
 
+#[derive(Clone)]
+pub struct ImgflipApiClient {
+    http: reqwest::Client,
+    endpoint: String,
+}
+
+impl ImgflipApiClient {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            endpoint: endpoint.into(),
+        }
+    }
+
+    pub fn default_public() -> Self {
+        Self::new("https://api.imgflip.com/get_memes")
+    }
+
+    pub async fn fetch_memes(&self) -> Result<Vec<MemeCandidate>, String> {
+        let body = self
+            .http
+            .get(&self.endpoint)
+            .send()
+            .await
+            .map_err(|err| err.to_string())?
+            .text()
+            .await
+            .map_err(|err| err.to_string())?;
+        parse_memes(&body)
+    }
+}
+
 pub fn parse_memes(body: &str) -> Result<Vec<MemeCandidate>, String> {
     let payload: ImgflipApiResponse = serde_json::from_str(body).map_err(|err| err.to_string())?;
 
