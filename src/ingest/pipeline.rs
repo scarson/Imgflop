@@ -1,8 +1,10 @@
 use std::sync::Mutex;
 
+use sqlx::SqlitePool;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::diff::{self, DiffEvent, RankedState};
+use crate::store;
 
 pub trait RankedSource: Send + Sync {
     fn fetch_ranked(&self) -> Result<Vec<RankedState>, String>;
@@ -80,6 +82,17 @@ impl<S: RankedSource> IngestPipeline<S> {
         state.current = next;
 
         Ok(())
+    }
+
+    pub async fn run_poll_recording_errors(&self, pool: &SqlitePool) -> Result<(), String> {
+        match self.run_poll().await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = store::record_poll_run_error(pool, "source_fetch_error", &err).await;
+                tracing::error!(error_kind = "source_fetch_error", message = %err, "poll failed");
+                Err(err)
+            }
+        }
     }
 
     pub async fn event_count(&self) -> usize {
