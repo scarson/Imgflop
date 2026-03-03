@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod config;
 pub mod diff;
+pub mod ingest;
 pub mod ops;
 pub mod sources;
 pub mod store;
