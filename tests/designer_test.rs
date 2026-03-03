@@ -1,15 +1,22 @@
 use imgflop::{designer::DesignerService, store::db};
+use tempfile::TempDir;
 
 struct TestCtx {
     pool: sqlx::SqlitePool,
     designer: DesignerService,
+    _temp: TempDir,
 }
 
 impl TestCtx {
     async fn new() -> Self {
         let pool = db::test_pool().await;
-        let designer = DesignerService::new(pool.clone());
-        Self { pool, designer }
+        let temp = TempDir::new().expect("temp dir should create");
+        let designer = DesignerService::new(pool.clone(), temp.path().to_path_buf());
+        Self {
+            pool,
+            designer,
+            _temp: temp,
+        }
     }
 
     async fn export_with_store(&self, store: bool) -> Result<i64, String> {

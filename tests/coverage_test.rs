@@ -6,6 +6,10 @@ use std::{
     time::Duration,
 };
 
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, SaltString},
+};
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
@@ -16,6 +20,7 @@ use imgflop::{
     diff::{self, DiffEvent, RankedState},
 };
 use serde_json::json;
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 #[test]
@@ -236,9 +241,21 @@ fn binary_serves_health_endpoint() {
         .local_addr()
         .expect("local addr should resolve")
         .port();
+    let temp = TempDir::new().expect("temp dir should create");
+    let db_path = temp.path().join("imgflop-test.db");
+    let db_url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
+    let salt = SaltString::encode_b64(b"fixedsaltfixed12").expect("test salt should encode");
+    let password_hash = Argon2::default()
+        .hash_password(b"admin", &salt)
+        .expect("password hash should build")
+        .to_string();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_imgflop"))
         .env("IMGFLOP_BIND", format!("127.0.0.1:{port}"))
+        .env("IMGFLOP_DB_URL", db_url)
+        .env("IMGFLOP_ASSETS_DIR", temp.path().join("images"))
+        .env("ADMIN_USER", "admin")
+        .env("ADMIN_PASSWORD_HASH", password_hash)
         .spawn()
         .expect("binary should start");
 

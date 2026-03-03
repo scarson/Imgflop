@@ -2,16 +2,22 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    body::Bytes,
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse},
     routing::{get, post},
 };
 use serde::Deserialize;
+use sqlx::SqlitePool;
 
 use crate::{
     auth::{AuthService, session::extract_session_token},
-    ops::{polling::PollRuntime, scheduler::Scheduler},
+    designer::{DesignerService, render::TextLayer},
+    ops::{
+        polling::{PollRuntime, trigger_and_spawn},
+        scheduler::Scheduler,
+    },
 };
 
 pub mod routes;
@@ -21,6 +27,8 @@ struct AppState {
     scheduler: Arc<Scheduler>,
     poll_runtime: Option<Arc<PollRuntime>>,
     auth: Arc<AuthService>,
+    pool: Option<SqlitePool>,
+    designer: Option<DesignerService>,
 }
 
 pub fn app_router() -> Router {
@@ -30,6 +38,8 @@ pub fn app_router() -> Router {
         scheduler,
         poll_runtime: None,
         auth,
+        pool: None,
+        designer: None,
     })
 }
 
@@ -46,12 +56,31 @@ pub fn app_router_with_scheduler_and_poll_runtime(
         scheduler,
         poll_runtime,
         auth,
+        pool: None,
+        designer: None,
+    })
+}
+
+pub fn app_router_runtime(
+    scheduler: Arc<Scheduler>,
+    poll_runtime: Arc<PollRuntime>,
+    auth: Arc<AuthService>,
+    pool: SqlitePool,
+    designer: DesignerService,
+) -> Router {
+    app_router_with_state(AppState {
+        scheduler,
+        poll_runtime: Some(poll_runtime),
+        auth,
+        pool: Some(pool),
+        designer: Some(designer),
     })
 }
 
 fn app_router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(gallery_page))
+        .route("/memes/{id}", get(meme_detail_page))
         .route("/create", get(create_page))
         .route("/create/export", post(create_export))
         .route("/health", get(|| async { "ok" }))
@@ -63,15 +92,55 @@ fn app_router_with_state(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn gallery_page() -> Html<&'static str> {
-    Html(routes::gallery::render())
+async fn gallery_page(State(state): State<AppState>) -> Html<String> {
+    if let Some(pool) = state.pool.as_ref() {
+        match load_gallery_rows(pool).await {
+            Ok(rows) => return Html(render_gallery_html(&rows)),
+            Err(err) => tracing::error!(error = %err, "failed to load gallery data"),
+        }
+    }
+    Html(routes::gallery::render().to_string())
+}
+
+async fn meme_detail_page(State(state): State<AppState>, Path(meme_id): Path<i64>) -> Html<String> {
+    if let Some(pool) = state.pool.as_ref() {
+        match load_meme_detail(pool, meme_id).await {
+            Ok(Some(detail)) => return Html(render_meme_detail_html(&detail)),
+            Ok(None) => return Html(render_missing_detail_html(meme_id)),
+            Err(err) => tracing::error!(error = %err, meme_id, "failed to load meme detail"),
+        }
+    }
+
+    Html(routes::gallery::render().to_string())
 }
 
 async fn create_page() -> Html<&'static str> {
     Html(routes::create::render())
 }
 
-async fn create_export() -> StatusCode {
+async fn create_export(State(state): State<AppState>, body: Bytes) -> StatusCode {
+    let parsed = if body.is_empty() {
+        CreateExportRequest::default()
+    } else {
+        serde_json::from_slice::<CreateExportRequest>(&body).unwrap_or_default()
+    };
+
+    if let Some(designer) = state.designer.as_ref() {
+        let layers: Vec<TextLayer> = parsed
+            .layers
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        if let Err(err) = designer
+            .export_with_layers(parsed.store.unwrap_or(true), &layers)
+            .await
+        {
+            tracing::error!(error = %err, "create export failed");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    }
+
     StatusCode::ACCEPTED
 }
 
@@ -84,7 +153,17 @@ async fn stylesheet() -> ([(&'static str, &'static str); 1], &'static str) {
 
 async fn admin_home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if state.auth.is_authenticated_headers(&headers) {
-        Html(routes::admin::render()).into_response()
+        if let Some(pool) = state.pool.as_ref() {
+            match load_admin_rows(pool).await {
+                Ok((runs, errors)) => Html(render_admin_html(&runs, &errors)).into_response(),
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to load admin rows");
+                    Html(routes::admin::render()).into_response()
+                }
+            }
+        } else {
+            Html(routes::admin::render()).into_response()
+        }
     } else {
         StatusCode::UNAUTHORIZED.into_response()
     }
@@ -102,7 +181,13 @@ async fn admin_login(
 ) -> impl IntoResponse {
     match state.auth.login(&payload.username, &payload.password) {
         Ok(token) => {
-            let cookie = format!("imgflop_session={token}; HttpOnly; SameSite=Lax; Path=/");
+            let mut cookie = format!(
+                "imgflop_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+                state.auth.session_ttl_secs()
+            );
+            if state.auth.secure_cookie() {
+                cookie.push_str("; Secure");
+            }
             let mut response = StatusCode::NO_CONTENT.into_response();
             response.headers_mut().insert(
                 header::SET_COOKIE,
@@ -132,30 +217,327 @@ async fn trigger_manual_poll(State(state): State<AppState>, headers: HeaderMap) 
         return StatusCode::UNAUTHORIZED;
     }
 
-    let should_start_worker = state.scheduler.trigger_manual().await;
-    if should_start_worker {
-        let scheduler = Arc::clone(&state.scheduler);
-        let poll_runtime = state.poll_runtime.clone();
-        tokio::spawn(async move {
-            run_manual_poll_worker(scheduler, poll_runtime).await;
-        });
-    }
+    trigger_and_spawn(Arc::clone(&state.scheduler), state.poll_runtime.clone()).await;
 
     StatusCode::ACCEPTED
 }
 
-async fn run_manual_poll_worker(scheduler: Arc<Scheduler>, poll_runtime: Option<Arc<PollRuntime>>) {
-    loop {
-        if let Some(runtime) = poll_runtime.as_ref() {
-            if let Err(err) = runtime.run_once().await {
-                tracing::error!(error = %err, "manual poll failed");
-            }
-        } else {
-            tracing::warn!("manual poll requested without poll runtime configured");
-        }
+#[derive(Debug, Default, Deserialize)]
+struct CreateExportRequest {
+    store: Option<bool>,
+    layers: Option<Vec<CreateLayer>>,
+}
 
-        if !scheduler.complete_run_and_take_repoll().await {
-            break;
+#[derive(Debug, Deserialize)]
+struct CreateLayer {
+    text: String,
+    x: Option<u32>,
+    y: Option<u32>,
+    scale: Option<u32>,
+    color_hex: Option<String>,
+}
+
+impl From<CreateLayer> for TextLayer {
+    fn from(value: CreateLayer) -> Self {
+        let color = value
+            .color_hex
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or([255, 255, 255, 255]);
+        Self {
+            text: value.text,
+            x: value.x.unwrap_or(24),
+            y: value.y.unwrap_or(24),
+            scale: value.scale.unwrap_or(4).max(1),
+            color,
         }
     }
+}
+
+#[derive(Debug)]
+struct GalleryRow {
+    meme_id: i64,
+    rank: i64,
+    title: String,
+    page_url: Option<String>,
+}
+
+#[derive(Debug)]
+struct MemeEventRow {
+    event_type: String,
+    old_rank: Option<i64>,
+    new_rank: Option<i64>,
+    at_utc: String,
+}
+
+#[derive(Debug)]
+struct MemeDetailView {
+    meme_id: i64,
+    title: String,
+    page_url: Option<String>,
+    events: Vec<MemeEventRow>,
+}
+
+#[derive(Debug)]
+struct AdminRunRow {
+    id: i64,
+    status: String,
+    started_at_utc: String,
+    completed_at_utc: Option<String>,
+}
+
+#[derive(Debug)]
+struct AdminErrorRow {
+    run_id: i64,
+    error_kind: String,
+    message: String,
+    at_utc: String,
+}
+
+async fn load_gallery_rows(pool: &SqlitePool) -> Result<Vec<GalleryRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (i64, i64, String, Option<String>)>(
+        r#"
+        SELECT t.meme_id, t.rank, m.title, m.page_url
+        FROM top_state_current t
+        JOIN memes m ON m.id = t.meme_id
+        WHERE t.scope = 'api'
+        ORDER BY t.rank ASC
+        LIMIT 200
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(meme_id, rank, title, page_url)| GalleryRow {
+            meme_id,
+            rank,
+            title,
+            page_url,
+        })
+        .collect())
+}
+
+async fn load_meme_detail(
+    pool: &SqlitePool,
+    meme_id: i64,
+) -> Result<Option<MemeDetailView>, sqlx::Error> {
+    let meme = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT title, page_url FROM memes WHERE id = ?",
+    )
+    .bind(meme_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((title, page_url)) = meme else {
+        return Ok(None);
+    };
+
+    let events = sqlx::query_as::<_, (String, Option<i64>, Option<i64>, String)>(
+        r#"
+        SELECT event_type, old_rank, new_rank, at_utc
+        FROM top_state_events
+        WHERE meme_id = ?
+        ORDER BY id DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(meme_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(event_type, old_rank, new_rank, at_utc)| MemeEventRow {
+        event_type,
+        old_rank,
+        new_rank,
+        at_utc,
+    })
+    .collect();
+
+    Ok(Some(MemeDetailView {
+        meme_id,
+        title,
+        page_url,
+        events,
+    }))
+}
+
+async fn load_admin_rows(
+    pool: &SqlitePool,
+) -> Result<(Vec<AdminRunRow>, Vec<AdminErrorRow>), sqlx::Error> {
+    let runs = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
+        r#"
+        SELECT id, status, started_at_utc, completed_at_utc
+        FROM poll_runs
+        ORDER BY id DESC
+        LIMIT 20
+        "#,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(
+        |(id, status, started_at_utc, completed_at_utc)| AdminRunRow {
+            id,
+            status,
+            started_at_utc,
+            completed_at_utc,
+        },
+    )
+    .collect();
+
+    let errors = sqlx::query_as::<_, (i64, String, String, String)>(
+        r#"
+        SELECT run_id, error_kind, message, at_utc
+        FROM poll_run_errors
+        ORDER BY id DESC
+        LIMIT 20
+        "#,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(run_id, error_kind, message, at_utc)| AdminErrorRow {
+        run_id,
+        error_kind,
+        message,
+        at_utc,
+    })
+    .collect();
+
+    Ok((runs, errors))
+}
+
+fn render_gallery_html(rows: &[GalleryRow]) -> String {
+    let mut html = String::from(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Top Memes</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Top Memes</h1></header><main class="gallery">"#,
+    );
+
+    if rows.is_empty() {
+        html.push_str(r#"<article class="card">No memes yet. Poll to ingest data.</article>"#);
+    } else {
+        for row in rows {
+            let title = escape_html(&row.title);
+            let link = format!("/memes/{}", row.meme_id);
+            let source_link = row
+                .page_url
+                .as_deref()
+                .map(escape_html)
+                .unwrap_or_else(|| "#".to_string());
+            html.push_str(&format!(
+                r#"<article class="card"><h2>#{rank} <a href="{detail}">{title}</a></h2><p><a href="{source}" target="_blank" rel="noreferrer">Source</a></p></article>"#,
+                rank = row.rank,
+                detail = link,
+                title = title,
+                source = source_link
+            ));
+        }
+    }
+
+    html.push_str("</main></body></html>");
+    html
+}
+
+fn render_meme_detail_html(view: &MemeDetailView) -> String {
+    let mut html = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>{title}</title><link rel="stylesheet" href="/static/app.css"/></head><body><main><h1>{title}</h1><p>Meme ID: {id}</p>"#,
+        title = escape_html(&view.title),
+        id = view.meme_id
+    );
+    if let Some(page_url) = &view.page_url {
+        html.push_str(&format!(
+            r#"<p><a href="{url}" target="_blank" rel="noreferrer">Open Source Page</a></p>"#,
+            url = escape_html(page_url)
+        ));
+    }
+    html.push_str(r#"<h2>Recent Rank Events</h2><table><thead><tr><th>Type</th><th>Old</th><th>New</th><th>At</th></tr></thead><tbody>"#);
+    if view.events.is_empty() {
+        html.push_str(r#"<tr><td colspan="4">No events yet.</td></tr>"#);
+    } else {
+        for event in &view.events {
+            html.push_str(&format!(
+                r#"<tr><td>{event_type}</td><td>{old_rank}</td><td>{new_rank}</td><td>{at_utc}</td></tr>"#,
+                event_type = escape_html(&event.event_type),
+                old_rank = event
+                    .old_rank
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                new_rank = event
+                    .new_rank
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                at_utc = escape_html(&event.at_utc),
+            ));
+        }
+    }
+    html.push_str("</tbody></table></main></body></html>");
+    html
+}
+
+fn render_missing_detail_html(meme_id: i64) -> String {
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><title>Meme Not Found</title></head><body><main><h1>Meme Not Found</h1><p>No meme for id {meme_id}.</p></main></body></html>"#
+    )
+}
+
+fn render_admin_html(runs: &[AdminRunRow], errors: &[AdminErrorRow]) -> String {
+    let mut html = String::from(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Admin</title><link rel="stylesheet" href="/static/app.css"/></head><body><main><h1>Admin</h1><p>Authenticated admin view.</p><h2>Manual Poll</h2><p>POST /admin/poll with your session cookie to trigger a run.</p><h2>Recent Poll Runs</h2><table><thead><tr><th>ID</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead><tbody>"#,
+    );
+
+    if runs.is_empty() {
+        html.push_str(r#"<tr><td colspan="4">No runs yet.</td></tr>"#);
+    } else {
+        for run in runs {
+            html.push_str(&format!(
+                r#"<tr><td>{id}</td><td>{status}</td><td>{started}</td><td>{completed}</td></tr>"#,
+                id = run.id,
+                status = escape_html(&run.status),
+                started = escape_html(&run.started_at_utc),
+                completed = run
+                    .completed_at_utc
+                    .as_deref()
+                    .map(escape_html)
+                    .unwrap_or_else(|| "-".to_string())
+            ));
+        }
+    }
+
+    html.push_str(r#"</tbody></table><h2>Recent Poll Errors</h2><table><thead><tr><th>Run</th><th>Kind</th><th>Message</th><th>At</th></tr></thead><tbody>"#);
+    if errors.is_empty() {
+        html.push_str(r#"<tr><td colspan="4">No errors.</td></tr>"#);
+    } else {
+        for err in errors {
+            html.push_str(&format!(
+                r#"<tr><td>{run_id}</td><td>{kind}</td><td>{message}</td><td>{at}</td></tr>"#,
+                run_id = err.run_id,
+                kind = escape_html(&err.error_kind),
+                message = escape_html(&err.message),
+                at = escape_html(&err.at_utc),
+            ));
+        }
+    }
+    html.push_str("</tbody></table></main></body></html>");
+    html
+}
+
+fn parse_hex_color(input: &str) -> Option<[u8; 4]> {
+    let value = input.trim().trim_start_matches('#');
+    if value.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&value[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&value[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&value[4..6], 16).ok()?;
+    Some([r, g, b, 255])
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }

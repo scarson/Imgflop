@@ -12,3 +12,31 @@ history_top_n = 2000
     assert!(cfg.polling.api_top_n.is_max());
     assert_eq!(cfg.polling.history_top_n, 2000);
 }
+
+#[test]
+fn runtime_config_requires_admin_env() {
+    let map = std::collections::HashMap::new();
+    let err =
+        imgflop::config::RuntimeConfig::from_map(&map).expect_err("missing admin env should fail");
+    assert!(err.contains("ADMIN_USER"));
+}
+
+#[test]
+fn runtime_config_parses_auth_and_polling_overrides() {
+    let mut map = std::collections::HashMap::new();
+    map.insert("ADMIN_USER".to_string(), "admin".to_string());
+    map.insert(
+        "ADMIN_PASSWORD_HASH".to_string(),
+        "$argon2id$dummy".to_string(),
+    );
+    map.insert("IMGFLOP_HISTORY_TOP_N".to_string(), "250".to_string());
+    map.insert("IMGFLOP_POLL_INTERVAL_SECS".to_string(), "30".to_string());
+    map.insert("IMGFLOP_COOKIE_SECURE".to_string(), "true".to_string());
+    map.insert("IMGFLOP_SESSION_TTL_SECS".to_string(), "7200".to_string());
+
+    let cfg = imgflop::config::RuntimeConfig::from_map(&map).expect("runtime config should parse");
+    assert_eq!(cfg.history_top_n, 250);
+    assert_eq!(cfg.poll_interval_secs, 30);
+    assert_eq!(cfg.auth.session_ttl_secs, 7200);
+    assert!(cfg.auth.secure_cookie);
+}
