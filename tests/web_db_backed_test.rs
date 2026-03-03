@@ -1,4 +1,5 @@
 use std::{
+    path::Path,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,11 +12,13 @@ use http_body_util::BodyExt;
 use imgflop::{
     auth::AuthService,
     designer::DesignerService,
+    designer::render,
     ops::{polling::PollRuntime, scheduler::Scheduler},
     store::db,
     web,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -130,6 +133,62 @@ async fn admin_page_renders_run_and_error_tables_from_db() {
     assert!(html.contains("upstream timeout"));
 }
 
+#[tokio::test]
+async fn create_page_renders_template_options_from_db() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let run_id = insert_success_run(&pool).await;
+    let asset_id = insert_image_asset(&pool, temp.path(), b"img-template").await;
+    let meme_id = insert_meme_with_asset(&pool, "Change My Mind", asset_id).await;
+    insert_top_state(&pool, meme_id, run_id, 1).await;
+
+    let app = runtime_app(pool.clone(), temp.path().to_path_buf()).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/create")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("Select Template"));
+    assert!(html.contains("Change My Mind"));
+    assert!(html.contains(&format!("/media/image/{asset_id}")));
+}
+
+#[tokio::test]
+async fn media_route_serves_local_asset_bytes() {
+    let pool = db::test_pool().await;
+    let temp = TempDir::new().expect("temp dir should create");
+    let png = render::render_png_bytes(&[]).expect("png should render");
+    let asset_id = insert_image_asset(&pool, temp.path(), &png).await;
+
+    let app = runtime_app(pool, temp.path().to_path_buf()).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/media/image/{asset_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+}
+
 async fn runtime_app(pool: sqlx::SqlitePool, assets_dir: std::path::PathBuf) -> axum::Router {
     let scheduler = Arc::new(Scheduler::new());
     let poll_runtime = Arc::new(PollRuntime::new(
@@ -170,6 +229,37 @@ async fn insert_meme(pool: &sqlx::SqlitePool, title: &str) -> i64 {
     .await
     .expect("meme should insert")
     .last_insert_rowid()
+}
+
+async fn insert_meme_with_asset(pool: &sqlx::SqlitePool, title: &str, asset_id: i64) -> i64 {
+    let now = now_epoch_seconds().to_string();
+    sqlx::query(
+        "INSERT INTO memes (title, page_url, first_seen_at_utc, last_seen_at_utc, image_asset_id) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(title)
+    .bind("https://imgflip.com")
+    .bind(&now)
+    .bind(&now)
+    .bind(asset_id)
+    .execute(pool)
+    .await
+    .expect("meme should insert")
+    .last_insert_rowid()
+}
+
+async fn insert_image_asset(pool: &sqlx::SqlitePool, root: &Path, bytes: &[u8]) -> i64 {
+    let sha = format!("{:x}", Sha256::digest(bytes));
+    let path = root.join(format!("asset-{sha}.png"));
+    std::fs::write(&path, bytes).expect("asset file should write");
+    sqlx::query("INSERT INTO image_assets (sha256, disk_path, bytes, mime) VALUES (?, ?, ?, ?)")
+        .bind(&sha)
+        .bind(path.to_string_lossy().to_string())
+        .bind(bytes.len() as i64)
+        .bind("image/png")
+        .execute(pool)
+        .await
+        .expect("image asset should insert")
+        .last_insert_rowid()
 }
 
 async fn insert_top_state(pool: &sqlx::SqlitePool, meme_id: i64, run_id: i64, rank: i64) {

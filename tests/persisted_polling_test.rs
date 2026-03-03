@@ -96,6 +96,13 @@ async fn api_client_poll_persists_top_state() {
         .await
         .expect("top state count should query");
     assert_eq!(top_state, 2);
+
+    let linked_assets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memes WHERE image_asset_id IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("linked asset count should query");
+    assert_eq!(linked_assets, 2);
 }
 
 #[tokio::test]

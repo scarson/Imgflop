@@ -34,7 +34,23 @@ impl DesignerService {
         store: bool,
         layers: &[TextLayer],
     ) -> Result<Option<i64>, sqlx::Error> {
-        let bytes = render::render_png_bytes(layers).map_err(to_sqlx_protocol_error)?;
+        self.export_from_template(None, store, layers).await
+    }
+
+    pub async fn export_from_template(
+        &self,
+        base_meme_id: Option<i64>,
+        store: bool,
+        layers: &[TextLayer],
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let base_image = self.load_template_image_bytes(base_meme_id).await?;
+        let effective_layers: Vec<TextLayer> = if layers.is_empty() {
+            vec![TextLayer::default()]
+        } else {
+            layers.to_vec()
+        };
+        let bytes = render::render_png_bytes_with_base(base_image.as_deref(), &effective_layers)
+            .map_err(to_sqlx_protocol_error)?;
         if !store {
             return Ok(None);
         }
@@ -52,29 +68,21 @@ impl DesignerService {
 
         let created_at_utc = now_epoch_seconds().to_string();
         let insert = query(
-            "INSERT INTO created_memes (base_meme_id, output_asset_id, stored, created_at_utc) VALUES (NULL, ?, 1, ?)",
+            "INSERT INTO created_memes (base_meme_id, output_asset_id, stored, created_at_utc) VALUES (?, ?, 1, ?)",
         )
+        .bind(base_meme_id)
         .bind(asset_id)
         .bind(&created_at_utc)
         .execute(&self.pool)
         .await?;
         let created_id = insert.last_insert_rowid();
 
-        query(
-            "INSERT INTO created_meme_layers (created_meme_id, layer_index, layer_text, x, y, style_json) VALUES (?, 0, ?, 0.5, 0.5, ?)",
-        )
-        .bind(created_id)
-        .bind("IMGFLOP")
-        .bind("{\"font\":\"font8x8\",\"scale\":4}")
-        .execute(&self.pool)
-        .await?;
-
-        for (index, layer) in layers.iter().enumerate() {
+        for (index, layer) in effective_layers.iter().enumerate() {
             query(
                 "INSERT INTO created_meme_layers (created_meme_id, layer_index, layer_text, x, y, style_json) VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(created_id)
-            .bind(index as i64 + 1)
+            .bind(index as i64)
             .bind(&layer.text)
             .bind(layer.x as f64)
             .bind(layer.y as f64)
@@ -87,6 +95,34 @@ impl DesignerService {
         }
 
         Ok(Some(created_id))
+    }
+
+    async fn load_template_image_bytes(
+        &self,
+        base_meme_id: Option<i64>,
+    ) -> Result<Option<Vec<u8>>, sqlx::Error> {
+        let Some(meme_id) = base_meme_id else {
+            return Ok(None);
+        };
+
+        let row = sqlx::query_as::<_, (String,)>(
+            r#"
+            SELECT a.disk_path
+            FROM memes m
+            JOIN image_assets a ON a.id = m.image_asset_id
+            WHERE m.id = ?
+            "#,
+        )
+        .bind(meme_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some((disk_path,)) = row else {
+            return Err(sqlx::Error::RowNotFound);
+        };
+
+        let bytes = std::fs::read(&disk_path).map_err(to_sqlx_protocol_error)?;
+        Ok(Some(bytes))
     }
 }
 

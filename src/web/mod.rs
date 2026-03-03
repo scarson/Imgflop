@@ -83,6 +83,7 @@ fn app_router_with_state(state: AppState) -> Router {
         .route("/memes/{id}", get(meme_detail_page))
         .route("/create", get(create_page))
         .route("/create/export", post(create_export))
+        .route("/media/image/{id}", get(media_image))
         .route("/health", get(|| async { "ok" }))
         .route("/static/app.css", get(stylesheet))
         .route("/admin", get(admin_home))
@@ -114,8 +115,15 @@ async fn meme_detail_page(State(state): State<AppState>, Path(meme_id): Path<i64
     Html(routes::gallery::render().to_string())
 }
 
-async fn create_page() -> Html<&'static str> {
-    Html(routes::create::render())
+async fn create_page(State(state): State<AppState>) -> Html<String> {
+    if let Some(pool) = state.pool.as_ref() {
+        match load_create_templates(pool).await {
+            Ok(rows) => return Html(render_create_html(&rows)),
+            Err(err) => tracing::error!(error = %err, "failed to load create templates"),
+        }
+    }
+
+    Html(routes::create::render().to_string())
 }
 
 async fn create_export(State(state): State<AppState>, body: Bytes) -> StatusCode {
@@ -133,7 +141,7 @@ async fn create_export(State(state): State<AppState>, body: Bytes) -> StatusCode
             .map(Into::into)
             .collect();
         if let Err(err) = designer
-            .export_with_layers(parsed.store.unwrap_or(true), &layers)
+            .export_from_template(parsed.base_meme_id, parsed.store.unwrap_or(true), &layers)
             .await
         {
             tracing::error!(error = %err, "create export failed");
@@ -142,6 +150,30 @@ async fn create_export(State(state): State<AppState>, body: Bytes) -> StatusCode
     }
 
     StatusCode::ACCEPTED
+}
+
+async fn media_image(
+    State(state): State<AppState>,
+    Path(asset_id): Path<i64>,
+) -> impl IntoResponse {
+    let Some(pool) = state.pool.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT disk_path, mime FROM image_assets WHERE id = ?",
+    )
+    .bind(asset_id)
+    .fetch_optional(pool)
+    .await;
+    let Some((disk_path, mime)) = row.ok().flatten() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    match std::fs::read(&disk_path) {
+        Ok(bytes) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn stylesheet() -> ([(&'static str, &'static str); 1], &'static str) {
@@ -225,6 +257,7 @@ async fn trigger_manual_poll(State(state): State<AppState>, headers: HeaderMap) 
 #[derive(Debug, Default, Deserialize)]
 struct CreateExportRequest {
     store: Option<bool>,
+    base_meme_id: Option<i64>,
     layers: Option<Vec<CreateLayer>>,
 }
 
@@ -260,6 +293,7 @@ struct GalleryRow {
     rank: i64,
     title: String,
     page_url: Option<String>,
+    image_asset_id: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -275,6 +309,7 @@ struct MemeDetailView {
     meme_id: i64,
     title: String,
     page_url: Option<String>,
+    image_asset_id: Option<i64>,
     events: Vec<MemeEventRow>,
 }
 
@@ -294,10 +329,18 @@ struct AdminErrorRow {
     at_utc: String,
 }
 
+#[derive(Debug)]
+struct CreateTemplateRow {
+    meme_id: i64,
+    rank: i64,
+    title: String,
+    image_asset_id: Option<i64>,
+}
+
 async fn load_gallery_rows(pool: &SqlitePool) -> Result<Vec<GalleryRow>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (i64, i64, String, Option<String>)>(
+    let rows = sqlx::query_as::<_, (i64, i64, String, Option<String>, Option<i64>)>(
         r#"
-        SELECT t.meme_id, t.rank, m.title, m.page_url
+        SELECT t.meme_id, t.rank, m.title, m.page_url, m.image_asset_id
         FROM top_state_current t
         JOIN memes m ON m.id = t.meme_id
         WHERE t.scope = 'api'
@@ -310,12 +353,15 @@ async fn load_gallery_rows(pool: &SqlitePool) -> Result<Vec<GalleryRow>, sqlx::E
 
     Ok(rows
         .into_iter()
-        .map(|(meme_id, rank, title, page_url)| GalleryRow {
-            meme_id,
-            rank,
-            title,
-            page_url,
-        })
+        .map(
+            |(meme_id, rank, title, page_url, image_asset_id)| GalleryRow {
+                meme_id,
+                rank,
+                title,
+                page_url,
+                image_asset_id,
+            },
+        )
         .collect())
 }
 
@@ -323,14 +369,14 @@ async fn load_meme_detail(
     pool: &SqlitePool,
     meme_id: i64,
 ) -> Result<Option<MemeDetailView>, sqlx::Error> {
-    let meme = sqlx::query_as::<_, (String, Option<String>)>(
-        "SELECT title, page_url FROM memes WHERE id = ?",
+    let meme = sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(
+        "SELECT title, page_url, image_asset_id FROM memes WHERE id = ?",
     )
     .bind(meme_id)
     .fetch_optional(pool)
     .await?;
 
-    let Some((title, page_url)) = meme else {
+    let Some((title, page_url, image_asset_id)) = meme else {
         return Ok(None);
     };
 
@@ -359,6 +405,7 @@ async fn load_meme_detail(
         meme_id,
         title,
         page_url,
+        image_asset_id,
         events,
     }))
 }
@@ -409,9 +456,34 @@ async fn load_admin_rows(
     Ok((runs, errors))
 }
 
+async fn load_create_templates(pool: &SqlitePool) -> Result<Vec<CreateTemplateRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (i64, i64, String, Option<i64>)>(
+        r#"
+        SELECT m.id, t.rank, m.title, m.image_asset_id
+        FROM top_state_current t
+        JOIN memes m ON m.id = t.meme_id
+        WHERE t.scope = 'api'
+        ORDER BY t.rank ASC
+        LIMIT 100
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(meme_id, rank, title, image_asset_id)| CreateTemplateRow {
+            meme_id,
+            rank,
+            title,
+            image_asset_id,
+        })
+        .collect())
+}
+
 fn render_gallery_html(rows: &[GalleryRow]) -> String {
     let mut html = String::from(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Top Memes</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Top Memes</h1></header><main class="gallery">"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Top Memes</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Top Memes</h1><nav><a href="/create">Create</a> <a href="/admin">Admin</a></nav></header><main class="gallery">"#,
     );
 
     if rows.is_empty() {
@@ -425,8 +497,17 @@ fn render_gallery_html(rows: &[GalleryRow]) -> String {
                 .as_deref()
                 .map(escape_html)
                 .unwrap_or_else(|| "#".to_string());
+            let preview = row
+                .image_asset_id
+                .map(|asset_id| {
+                    format!(
+                        r#"<img class="thumb" src="/media/image/{asset_id}" alt="{title} preview" loading="lazy"/>"#,
+                    )
+                })
+                .unwrap_or_else(|| r#"<div class="thumb placeholder">No Image</div>"#.to_string());
             html.push_str(&format!(
-                r#"<article class="card"><h2>#{rank} <a href="{detail}">{title}</a></h2><p><a href="{source}" target="_blank" rel="noreferrer">Source</a></p></article>"#,
+                r#"<article class="card">{preview}<h2>#{rank} <a href="{detail}">{title}</a></h2><p><a href="{source}" target="_blank" rel="noreferrer">Source</a></p></article>"#,
+                preview = preview,
                 rank = row.rank,
                 detail = link,
                 title = title,
@@ -441,10 +522,16 @@ fn render_gallery_html(rows: &[GalleryRow]) -> String {
 
 fn render_meme_detail_html(view: &MemeDetailView) -> String {
     let mut html = format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>{title}</title><link rel="stylesheet" href="/static/app.css"/></head><body><main><h1>{title}</h1><p>Meme ID: {id}</p>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>{title}</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>{title}</h1><nav><a href="/">Gallery</a> <a href="/create">Create</a></nav></header><main><p>Meme ID: {id}</p>"#,
         title = escape_html(&view.title),
         id = view.meme_id
     );
+    if let Some(asset_id) = view.image_asset_id {
+        html.push_str(&format!(
+            r#"<p><img class="detail-image" src="/media/image/{asset_id}" alt="{title} image"/></p>"#,
+            title = escape_html(&view.title)
+        ));
+    }
     if let Some(page_url) = &view.page_url {
         html.push_str(&format!(
             r#"<p><a href="{url}" target="_blank" rel="noreferrer">Open Source Page</a></p>"#,
@@ -519,6 +606,48 @@ fn render_admin_html(runs: &[AdminRunRow], errors: &[AdminErrorRow]) -> String {
         }
     }
     html.push_str("</tbody></table></main></body></html>");
+    html
+}
+
+fn render_create_html(templates: &[CreateTemplateRow]) -> String {
+    let mut html = String::from(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Create Meme</title><link rel="stylesheet" href="/static/app.css"/></head><body><header class="topbar"><h1>Create Meme</h1><nav><a href="/">Gallery</a> <a href="/admin">Admin</a></nav></header><main class="create-layout"><section class="panel"><h2>Select Template</h2><div class="template-grid">"#,
+    );
+
+    if templates.is_empty() {
+        html.push_str(
+            r#"<p>No templates available yet. Trigger a poll from admin to load meme templates.</p>"#,
+        );
+    } else {
+        for (index, template) in templates.iter().enumerate() {
+            let checked = if index == 0 { " checked" } else { "" };
+            let thumb = template
+                .image_asset_id
+                .map(|asset_id| {
+                    format!(
+                        r#"<img class="template-thumb" src="/media/image/{asset_id}" alt="{title} template"/>"#,
+                        title = escape_html(&template.title),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    r#"<div class="template-thumb placeholder">No Preview</div>"#.to_string()
+                });
+
+            html.push_str(&format!(
+                r#"<label class="template-option"><input type="radio" name="base_meme_id" value="{meme_id}"{checked}/><span class="template-meta">#{rank}</span>{thumb}<span class="template-title">{title}</span></label>"#,
+                meme_id = template.meme_id,
+                checked = checked,
+                rank = template.rank,
+                thumb = thumb,
+                title = escape_html(&template.title),
+            ));
+        }
+    }
+
+    html.push_str(
+        r##"</div></section><section class="panel"><h2>Text Layers</h2><form id="create-form" class="create-form"><label>Top Text<input type="text" name="top_text" value="TOP TEXT" maxlength="120"/></label><label>Bottom Text<input type="text" name="bottom_text" value="BOTTOM TEXT" maxlength="120"/></label><label>Scale<input type="number" name="scale" value="4" min="1" max="10"/></label><label>Color<input type="color" name="color_hex" value="#ffffff"/></label><label>Bottom Y<input type="number" name="bottom_y" value="360" min="0" max="2000"/></label><label class="checkbox-row"><input type="checkbox" name="store" checked/> Store export in local DB</label><button type="submit">Render + Export</button></form><p id="create-result" class="status"></p></section></main><script>(function(){const form=document.getElementById('create-form');const result=document.getElementById('create-result');if(!form){return;}form.addEventListener('submit',async function(ev){ev.preventDefault();result.textContent='Rendering...';const selected=document.querySelector('input[name="base_meme_id"]:checked');const topText=form.top_text.value.trim();const bottomText=form.bottom_text.value.trim();const scale=Math.max(1,Number(form.scale.value)||4);const color=form.color_hex.value||'#ffffff';const bottomY=Math.max(0,Number(form.bottom_y.value)||360);const layers=[];if(topText){layers.push({text:topText,x:24,y:24,scale:scale,color_hex:color});}if(bottomText){layers.push({text:bottomText,x:24,y:bottomY,scale:scale,color_hex:color});}const payload={store:!!form.store.checked,base_meme_id:selected?Number(selected.value):null,layers:layers};try{const res=await fetch('/create/export',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});if(res.ok){result.textContent='Export accepted.';}else{result.textContent='Export failed ('+res.status+').';}}catch(_err){result.textContent='Network error while exporting.';}});})();</script></body></html>"##,
+    );
+
     html
 }
 

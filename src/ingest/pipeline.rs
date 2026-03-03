@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -132,10 +133,14 @@ impl PersistedPoller {
         candidates: Vec<MemeCandidate>,
     ) -> Result<PollRunSummary, String> {
         let mut images_downloaded = 0usize;
+        let mut downloaded_assets: HashMap<String, i64> = HashMap::new();
         for candidate in &candidates {
             match self.try_download_asset(candidate).await {
-                Ok(true) => images_downloaded += 1,
-                Ok(false) => {}
+                Ok(Some(asset_id)) => {
+                    images_downloaded += 1;
+                    downloaded_assets.insert(candidate.source_meme_id.clone(), asset_id);
+                }
+                Ok(None) => {}
                 Err(err) => {
                     tracing::warn!(source_meme_id = %candidate.source_meme_id, error = %err, "image download skipped");
                 }
@@ -158,7 +163,12 @@ impl PersistedPoller {
         let mut next_rows: Vec<(i64, u32)> = Vec::new();
         for candidate in &candidates {
             let meme_id = self
-                .upsert_meme_record(&mut tx, candidate, &now)
+                .upsert_meme_record(
+                    &mut tx,
+                    candidate,
+                    &now,
+                    downloaded_assets.get(&candidate.source_meme_id).copied(),
+                )
                 .await
                 .map_err(|err| err.to_string())?;
             next_rows.push((meme_id, candidate.rank));
@@ -251,6 +261,7 @@ impl PersistedPoller {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         candidate: &MemeCandidate,
         now: &str,
+        image_asset_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
         let existing_meme_id: Option<i64> = sqlx::query_scalar(
             "SELECT meme_id FROM source_records WHERE source = ? AND source_meme_id = ?",
@@ -263,11 +274,12 @@ impl PersistedPoller {
         match existing_meme_id {
             Some(meme_id) => {
                 sqlx::query(
-                    "UPDATE memes SET title = ?, page_url = ?, last_seen_at_utc = ? WHERE id = ?",
+                    "UPDATE memes SET title = ?, page_url = ?, last_seen_at_utc = ?, image_asset_id = COALESCE(?, image_asset_id) WHERE id = ?",
                 )
                 .bind(&candidate.name)
                 .bind(&candidate.page_url)
                 .bind(now)
+                .bind(image_asset_id)
                 .bind(meme_id)
                 .execute(&mut **tx)
                 .await?;
@@ -275,12 +287,13 @@ impl PersistedPoller {
             }
             None => {
                 let inserted = sqlx::query(
-                    "INSERT INTO memes (title, page_url, first_seen_at_utc, last_seen_at_utc) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO memes (title, page_url, first_seen_at_utc, last_seen_at_utc, image_asset_id) VALUES (?, ?, ?, ?, ?)",
                 )
                 .bind(&candidate.name)
                 .bind(&candidate.page_url)
                 .bind(now)
                 .bind(now)
+                .bind(image_asset_id)
                 .execute(&mut **tx)
                 .await?;
                 let meme_id = inserted.last_insert_rowid();
@@ -299,7 +312,7 @@ impl PersistedPoller {
         }
     }
 
-    async fn try_download_asset(&self, candidate: &MemeCandidate) -> Result<bool, String> {
+    async fn try_download_asset(&self, candidate: &MemeCandidate) -> Result<Option<i64>, String> {
         let response = self
             .http_client
             .get(&candidate.image_url)
@@ -307,7 +320,7 @@ impl PersistedPoller {
             .await
             .map_err(|err| err.to_string())?;
         if !response.status().is_success() {
-            return Ok(false);
+            return Ok(None);
         }
 
         let mime = response
@@ -318,11 +331,18 @@ impl PersistedPoller {
             .to_string();
         let bytes = response.bytes().await.map_err(|err| err.to_string())?;
 
-        self.asset_store
+        let stored_asset = self
+            .asset_store
             .store_bytes(&mime, &bytes)
             .await
             .map_err(|err| format!("{err:?}"))?;
-        Ok(true)
+        let asset_id: i64 = sqlx::query_scalar("SELECT id FROM image_assets WHERE sha256 = ?")
+            .bind(&stored_asset.sha256)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|err| err.to_string())?;
+
+        Ok(Some(asset_id))
     }
 }
 

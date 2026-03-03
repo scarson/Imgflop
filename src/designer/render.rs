@@ -23,8 +23,20 @@ impl Default for TextLayer {
 }
 
 pub fn render_png_bytes(layers: &[TextLayer]) -> Result<Vec<u8>, image::ImageError> {
-    let mut image = RgbaImage::from_pixel(800, 450, Rgba([32, 35, 42, 255]));
-    draw_background_gradient(&mut image);
+    render_png_bytes_with_base(None, layers)
+}
+
+pub fn render_png_bytes_with_base(
+    base_image: Option<&[u8]>,
+    layers: &[TextLayer],
+) -> Result<Vec<u8>, image::ImageError> {
+    let mut image = if let Some(bytes) = base_image {
+        image::load_from_memory(bytes)?.to_rgba8()
+    } else {
+        let mut generated = RgbaImage::from_pixel(800, 450, Rgba([32, 35, 42, 255]));
+        draw_background_gradient(&mut generated);
+        generated
+    };
 
     let base_layers: Vec<TextLayer> = if layers.is_empty() {
         vec![TextLayer::default()]
@@ -61,10 +73,11 @@ fn draw_background_gradient(image: &mut RgbaImage) {
 fn draw_text_layer(image: &mut RgbaImage, layer: &TextLayer) {
     let scale = layer.scale.max(1);
     let mut cursor_x = layer.x;
-    let cursor_y = layer.y;
+    let mut cursor_y = layer.y;
     for ch in layer.text.chars() {
         if ch == '\n' {
             cursor_x = layer.x;
+            cursor_y = cursor_y.saturating_add(9 * scale);
             continue;
         }
         draw_char(image, ch, cursor_x, cursor_y, scale, layer.color);
