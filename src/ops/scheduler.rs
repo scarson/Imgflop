@@ -26,12 +26,25 @@ impl Scheduler {
         state.running = false;
     }
 
-    pub async fn trigger_manual(&self) {
+    pub async fn trigger_manual(&self) -> bool {
         let mut state = self.state.lock().await;
         if state.running {
             state.pending_repoll = true;
+            false
         } else {
             state.running = true;
+            true
+        }
+    }
+
+    pub async fn complete_run_and_take_repoll(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.pending_repoll {
+            state.pending_repoll = false;
+            true
+        } else {
+            state.running = false;
+            false
         }
     }
 

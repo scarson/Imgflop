@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::{
     auth::{AuthService, session::extract_session_token},
-    ops::scheduler::Scheduler,
+    ops::{polling::PollRuntime, scheduler::Scheduler},
 };
 
 pub mod routes;
@@ -19,18 +19,34 @@ pub mod routes;
 #[derive(Clone)]
 struct AppState {
     scheduler: Arc<Scheduler>,
+    poll_runtime: Option<Arc<PollRuntime>>,
     auth: Arc<AuthService>,
 }
 
 pub fn app_router() -> Router {
     let scheduler = Arc::new(Scheduler::new());
     let auth = Arc::new(AuthService::dev_default());
-    app_router_with_state(AppState { scheduler, auth })
+    app_router_with_state(AppState {
+        scheduler,
+        poll_runtime: None,
+        auth,
+    })
 }
 
 pub fn app_router_with_scheduler(scheduler: Arc<Scheduler>) -> Router {
+    app_router_with_scheduler_and_poll_runtime(scheduler, None)
+}
+
+pub fn app_router_with_scheduler_and_poll_runtime(
+    scheduler: Arc<Scheduler>,
+    poll_runtime: Option<Arc<PollRuntime>>,
+) -> Router {
     let auth = Arc::new(AuthService::dev_default());
-    app_router_with_state(AppState { scheduler, auth })
+    app_router_with_state(AppState {
+        scheduler,
+        poll_runtime,
+        auth,
+    })
 }
 
 fn app_router_with_state(state: AppState) -> Router {
@@ -116,6 +132,30 @@ async fn trigger_manual_poll(State(state): State<AppState>, headers: HeaderMap) 
         return StatusCode::UNAUTHORIZED;
     }
 
-    state.scheduler.trigger_manual().await;
+    let should_start_worker = state.scheduler.trigger_manual().await;
+    if should_start_worker {
+        let scheduler = Arc::clone(&state.scheduler);
+        let poll_runtime = state.poll_runtime.clone();
+        tokio::spawn(async move {
+            run_manual_poll_worker(scheduler, poll_runtime).await;
+        });
+    }
+
     StatusCode::ACCEPTED
+}
+
+async fn run_manual_poll_worker(scheduler: Arc<Scheduler>, poll_runtime: Option<Arc<PollRuntime>>) {
+    loop {
+        if let Some(runtime) = poll_runtime.as_ref() {
+            if let Err(err) = runtime.run_once().await {
+                tracing::error!(error = %err, "manual poll failed");
+            }
+        } else {
+            tracing::warn!("manual poll requested without poll runtime configured");
+        }
+
+        if !scheduler.complete_run_and_take_repoll().await {
+            break;
+        }
+    }
 }

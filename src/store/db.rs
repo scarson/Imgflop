@@ -2,6 +2,16 @@ use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+pub async fn connect_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(database_url)
+        .await?;
+
+    MIGRATOR.run(&pool).await?;
+    Ok(pool)
+}
+
 pub async fn test_pool() -> SqlitePool {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
