@@ -222,6 +222,7 @@ Integration tests:
 - Verify no-event writes on unchanged runs.
 - Locking behavior, stale recovery, pending repoll semantics.
 - Asset atomic write and dedupe behavior.
+- Use `rust.testcontainers` for integration tests that depend on external services (for example HTTP dependencies, queue backends, or non-SQLite data stores).
 
 UI/E2E tests:
 - Gallery filtering/pagination.

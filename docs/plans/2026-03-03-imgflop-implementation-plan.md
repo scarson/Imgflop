@@ -634,5 +634,6 @@ git commit -m "chore: finalize e2e verification and docs"
 - Keep commits small and task-scoped.
 - Do not begin Task N+1 until Task N tests are green.
 - Prefer deterministic fixtures for API/scraper tests.
+- Use `rust.testcontainers` wherever tests require external services (and prefer local in-memory/temp resources when no external service is involved).
 - Preserve local-first defaults (`127.0.0.1`, local files, no CDN).
 - Treat line coverage below 80% as a hard failure until fixed.
