@@ -102,7 +102,15 @@ impl PersistedPoller {
     }
 
     pub async fn run_api_poll(&self, client: &ImgflipApiClient) -> Result<PollRunSummary, String> {
-        let candidates = client.fetch_memes().await?;
+        self.run_api_poll_with_top_n(client, None).await
+    }
+
+    pub async fn run_api_poll_with_top_n(
+        &self,
+        client: &ImgflipApiClient,
+        api_top_n: Option<u32>,
+    ) -> Result<PollRunSummary, String> {
+        let candidates = client.fetch_memes_with_top_n(api_top_n).await?;
         self.run_with_candidates(candidates).await
     }
 

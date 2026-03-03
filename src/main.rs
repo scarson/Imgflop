@@ -30,9 +30,10 @@ async fn main() {
                 config.database_url
             )
         });
-    let poll_runtime = Arc::new(PollRuntime::new(
+    let poll_runtime = Arc::new(PollRuntime::new_with_api_top_n(
         pool.clone(),
         assets_root.clone(),
+        config.api_top_n.clone(),
         config.history_top_n,
         config.api_endpoint.clone(),
     ));

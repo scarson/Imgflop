@@ -21,6 +21,13 @@ impl ImgflipApiClient {
     }
 
     pub async fn fetch_memes(&self) -> Result<Vec<MemeCandidate>, String> {
+        self.fetch_memes_with_top_n(None).await
+    }
+
+    pub async fn fetch_memes_with_top_n(
+        &self,
+        api_top_n: Option<u32>,
+    ) -> Result<Vec<MemeCandidate>, String> {
         let body = self
             .http
             .get(&self.endpoint)
@@ -30,7 +37,11 @@ impl ImgflipApiClient {
             .text()
             .await
             .map_err(|err| err.to_string())?;
-        parse_memes(&body)
+        let mut memes = parse_memes(&body)?;
+        if let Some(limit) = api_top_n {
+            memes.truncate(limit as usize);
+        }
+        Ok(memes)
     }
 }
 

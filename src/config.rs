@@ -38,6 +38,7 @@ pub struct RuntimeConfig {
     pub bind: String,
     pub database_url: String,
     pub assets_dir: String,
+    pub api_top_n: ApiTopN,
     pub history_top_n: u32,
     pub poll_interval_secs: u64,
     pub api_endpoint: Option<String>,
@@ -56,6 +57,7 @@ impl RuntimeConfig {
         let database_url =
             get("IMGFLOP_DB_URL").unwrap_or_else(|| "sqlite://imgflop.db?mode=rwc".to_string());
         let assets_dir = get("IMGFLOP_ASSETS_DIR").unwrap_or_else(|| "data/images".to_string());
+        let api_top_n = parse_api_top_n_env(get("IMGFLOP_API_TOP_N"))?;
 
         let history_top_n =
             parse_u32_at_least_one(get("IMGFLOP_HISTORY_TOP_N"), "IMGFLOP_HISTORY_TOP_N", 100)?;
@@ -84,6 +86,7 @@ impl RuntimeConfig {
             bind,
             database_url,
             assets_dir,
+            api_top_n,
             history_top_n,
             poll_interval_secs,
             api_endpoint,
@@ -185,4 +188,23 @@ fn parse_bool(value: Option<String>, default: bool) -> bool {
         }
         None => default,
     }
+}
+
+fn parse_api_top_n_env(value: Option<String>) -> Result<ApiTopN, String> {
+    let Some(raw) = value else {
+        return Ok(ApiTopN::Max);
+    };
+
+    if raw.eq_ignore_ascii_case("max") {
+        return Ok(ApiTopN::Max);
+    }
+
+    let parsed = raw
+        .parse::<u32>()
+        .map_err(|_| "IMGFLOP_API_TOP_N must be 'max' or integer >= 1".to_string())?;
+    if parsed == 0 {
+        return Err("IMGFLOP_API_TOP_N must be >= 1".to_string());
+    }
+
+    Ok(ApiTopN::Int(parsed))
 }
