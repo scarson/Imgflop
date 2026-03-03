@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use sqlx::{query, query_scalar, SqlitePool};
+use sqlx::{SqlitePool, query, query_scalar};
 
 pub mod render;
 

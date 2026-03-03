@@ -8,7 +8,12 @@ use tower::ServiceExt;
 async fn admin_route_requires_login() {
     let app = imgflop::web::app_router();
     let res = app
-        .oneshot(Request::builder().uri("/admin").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .expect("request should complete");
 

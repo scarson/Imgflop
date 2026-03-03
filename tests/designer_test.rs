@@ -33,6 +33,9 @@ impl TestCtx {
 #[tokio::test]
 async fn stored_export_creates_created_meme_record() {
     let ctx = TestCtx::new().await;
-    let id = ctx.export_with_store(true).await.expect("export should succeed");
+    let id = ctx
+        .export_with_store(true)
+        .await
+        .expect("export should succeed");
     assert!(ctx.created_exists(id).await);
 }

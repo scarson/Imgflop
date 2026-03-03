@@ -28,8 +28,10 @@ pub enum DiffEvent {
 }
 
 pub fn compute(prev: &[RankedState], next: &[RankedState]) -> Vec<DiffEvent> {
-    let prev_map: HashMap<&str, &RankedState> = prev.iter().map(|row| (row.meme_id.as_str(), row)).collect();
-    let next_map: HashMap<&str, &RankedState> = next.iter().map(|row| (row.meme_id.as_str(), row)).collect();
+    let prev_map: HashMap<&str, &RankedState> =
+        prev.iter().map(|row| (row.meme_id.as_str(), row)).collect();
+    let next_map: HashMap<&str, &RankedState> =
+        next.iter().map(|row| (row.meme_id.as_str(), row)).collect();
 
     let mut events = Vec::new();
 

@@ -1,5 +1,5 @@
-pub mod auth;
 pub mod assets;
+pub mod auth;
 pub mod config;
 pub mod designer;
 pub mod diff;

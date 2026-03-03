@@ -2,7 +2,7 @@ pub mod db;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sqlx::{query, query_scalar, SqlitePool};
+use sqlx::{SqlitePool, query, query_scalar};
 
 pub async fn created_meme_exists(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
     let count: i64 = query_scalar("SELECT COUNT(*) FROM created_memes WHERE id = ?")

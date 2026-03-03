@@ -1,17 +1,16 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::State,
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse},
     routing::{get, post},
-    Json,
-    Router,
 };
 use serde::Deserialize;
 
 use crate::{
-    auth::{session::extract_session_token, AuthService},
+    auth::{AuthService, session::extract_session_token},
     ops::scheduler::Scheduler,
 };
 
@@ -57,11 +56,14 @@ async fn create_page() -> Html<&'static str> {
 }
 
 async fn create_export() -> StatusCode {
-    StatusCode::OK
+    StatusCode::ACCEPTED
 }
 
 async fn stylesheet() -> ([(&'static str, &'static str); 1], &'static str) {
-    ([("content-type", "text/css; charset=utf-8")], include_str!("static/app.css"))
+    (
+        [("content-type", "text/css; charset=utf-8")],
+        include_str!("static/app.css"),
+    )
 }
 
 async fn admin_home(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
