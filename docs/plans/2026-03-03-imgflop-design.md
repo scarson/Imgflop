@@ -232,6 +232,10 @@ CI gates:
 - `cargo fmt --check`
 - `cargo clippy -- -D warnings`
 - `cargo test`
+- `cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines 80`
+
+Coverage policy:
+- Minimum 80% line coverage is required in CI.
 
 ## 14. Risks and Mitigations
 
