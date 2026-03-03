@@ -1,6 +1,14 @@
-use std::{collections::HashMap, env};
+use std::{
+    collections::HashMap,
+    env, fs,
+    net::SocketAddr,
+    path::Path,
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::Deserialize;
+use sqlx::sqlite::SqliteConnectOptions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiTopN {
@@ -54,6 +62,7 @@ impl RuntimeConfig {
         let get = |key: &str| values.get(key).cloned();
 
         let bind = get("IMGFLOP_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_string());
+        validate_bind(&bind)?;
         let database_url =
             get("IMGFLOP_DB_URL").unwrap_or_else(|| "sqlite://imgflop.db?mode=rwc".to_string());
         let assets_dir = get("IMGFLOP_ASSETS_DIR").unwrap_or_else(|| "data/images".to_string());
@@ -81,6 +90,9 @@ impl RuntimeConfig {
         )?;
         let secure_cookie = parse_bool(get("IMGFLOP_COOKIE_SECURE"), false);
         let api_endpoint = get("IMGFLOP_API_ENDPOINT").filter(|value| !value.trim().is_empty());
+        if let Some(endpoint) = api_endpoint.as_deref() {
+            validate_api_endpoint(endpoint)?;
+        }
 
         Ok(Self {
             bind,
@@ -97,6 +109,16 @@ impl RuntimeConfig {
                 secure_cookie,
             },
         })
+    }
+
+    pub fn validate_startup(&self) -> Result<(), String> {
+        validate_bind(&self.bind)?;
+        validate_sqlite_url(&self.database_url)?;
+        if let Some(endpoint) = self.api_endpoint.as_deref() {
+            validate_api_endpoint(endpoint)?;
+        }
+        validate_assets_dir_writable(&self.assets_dir)?;
+        Ok(())
     }
 }
 
@@ -207,4 +229,50 @@ fn parse_api_top_n_env(value: Option<String>) -> Result<ApiTopN, String> {
     }
 
     Ok(ApiTopN::Int(parsed))
+}
+
+fn validate_bind(bind: &str) -> Result<(), String> {
+    bind.parse::<SocketAddr>().map(|_| ()).map_err(|_| {
+        "IMGFLOP_BIND must be a valid socket address (example: 127.0.0.1:8080)".to_string()
+    })
+}
+
+fn validate_api_endpoint(endpoint: &str) -> Result<(), String> {
+    reqwest::Url::parse(endpoint)
+        .map(|_| ())
+        .map_err(|_| "IMGFLOP_API_ENDPOINT must be a valid URL".to_string())
+}
+
+fn validate_sqlite_url(database_url: &str) -> Result<(), String> {
+    if !database_url.starts_with("sqlite:") {
+        return Err("IMGFLOP_DB_URL must start with sqlite:".to_string());
+    }
+    SqliteConnectOptions::from_str(database_url)
+        .map(|_| ())
+        .map_err(|_| "IMGFLOP_DB_URL must be a valid sqlite connection URL".to_string())
+}
+
+fn validate_assets_dir_writable(assets_dir: &str) -> Result<(), String> {
+    let path = Path::new(assets_dir);
+    fs::create_dir_all(path)
+        .map_err(|err| format!("IMGFLOP_ASSETS_DIR is not creatable: {assets_dir} ({err})"))?;
+    if !path.is_dir() {
+        return Err(format!(
+            "IMGFLOP_ASSETS_DIR is not a directory: {assets_dir}"
+        ));
+    }
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let probe = path.join(format!(
+        ".imgflop-write-probe-{stamp}-{}",
+        std::process::id()
+    ));
+    fs::write(&probe, b"probe")
+        .map_err(|err| format!("IMGFLOP_ASSETS_DIR is not writable: {assets_dir} ({err})"))?;
+    fs::remove_file(&probe)
+        .map_err(|err| format!("IMGFLOP_ASSETS_DIR cleanup failed: {assets_dir} ({err})"))?;
+    Ok(())
 }

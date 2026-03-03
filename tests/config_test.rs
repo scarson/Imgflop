@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 #[test]
 fn parses_api_max_and_history_top_n() {
     let cfg = imgflop::config::from_toml(
@@ -15,7 +17,7 @@ history_top_n = 2000
 
 #[test]
 fn runtime_config_requires_admin_env() {
-    let map = std::collections::HashMap::new();
+    let map = HashMap::new();
     let err =
         imgflop::config::RuntimeConfig::from_map(&map).expect_err("missing admin env should fail");
     assert!(err.contains("ADMIN_USER"));
@@ -23,12 +25,7 @@ fn runtime_config_requires_admin_env() {
 
 #[test]
 fn runtime_config_parses_auth_and_polling_overrides() {
-    let mut map = std::collections::HashMap::new();
-    map.insert("ADMIN_USER".to_string(), "admin".to_string());
-    map.insert(
-        "ADMIN_PASSWORD_HASH".to_string(),
-        "$argon2id$dummy".to_string(),
-    );
+    let mut map = base_runtime_map();
     map.insert("IMGFLOP_HISTORY_TOP_N".to_string(), "250".to_string());
     map.insert("IMGFLOP_POLL_INTERVAL_SECS".to_string(), "30".to_string());
     map.insert("IMGFLOP_COOKIE_SECURE".to_string(), "true".to_string());
@@ -43,12 +40,7 @@ fn runtime_config_parses_auth_and_polling_overrides() {
 
 #[test]
 fn runtime_config_parses_api_top_n_env() {
-    let mut map = std::collections::HashMap::new();
-    map.insert("ADMIN_USER".to_string(), "admin".to_string());
-    map.insert(
-        "ADMIN_PASSWORD_HASH".to_string(),
-        "$argon2id$dummy".to_string(),
-    );
+    let mut map = base_runtime_map();
     map.insert("IMGFLOP_API_TOP_N".to_string(), "25".to_string());
 
     let cfg = imgflop::config::RuntimeConfig::from_map(&map).expect("runtime config should parse");
@@ -62,15 +54,88 @@ fn runtime_config_parses_api_top_n_env() {
 
 #[test]
 fn runtime_config_rejects_invalid_api_top_n_env() {
-    let mut map = std::collections::HashMap::new();
-    map.insert("ADMIN_USER".to_string(), "admin".to_string());
-    map.insert(
-        "ADMIN_PASSWORD_HASH".to_string(),
-        "$argon2id$dummy".to_string(),
-    );
+    let mut map = base_runtime_map();
     map.insert("IMGFLOP_API_TOP_N".to_string(), "0".to_string());
 
     let err = imgflop::config::RuntimeConfig::from_map(&map)
         .expect_err("api top-n of 0 should be rejected");
     assert!(err.contains("IMGFLOP_API_TOP_N"));
+}
+
+#[test]
+fn runtime_config_rejects_invalid_bind() {
+    let mut map = base_runtime_map();
+    map.insert("IMGFLOP_BIND".to_string(), "not-a-socket".to_string());
+
+    let err = imgflop::config::RuntimeConfig::from_map(&map)
+        .expect_err("invalid bind address should fail");
+    assert!(err.contains("IMGFLOP_BIND"));
+}
+
+#[test]
+fn runtime_config_rejects_invalid_api_endpoint() {
+    let mut map = base_runtime_map();
+    map.insert("IMGFLOP_API_ENDPOINT".to_string(), "not a url".to_string());
+
+    let err = imgflop::config::RuntimeConfig::from_map(&map)
+        .expect_err("invalid api endpoint should fail");
+    assert!(err.contains("IMGFLOP_API_ENDPOINT"));
+}
+
+#[test]
+fn runtime_config_validate_startup_accepts_creatable_assets_dir() {
+    let temp = tempfile::TempDir::new().expect("temp dir should create");
+    let assets = temp.path().join("images");
+
+    let mut map = base_runtime_map();
+    map.insert(
+        "IMGFLOP_ASSETS_DIR".to_string(),
+        assets.to_string_lossy().to_string(),
+    );
+
+    let cfg = imgflop::config::RuntimeConfig::from_map(&map).expect("config should parse");
+    cfg.validate_startup()
+        .expect("startup validation should succeed");
+    assert!(assets.is_dir());
+}
+
+#[test]
+fn runtime_config_validate_startup_rejects_assets_file_path() {
+    let temp = tempfile::TempDir::new().expect("temp dir should create");
+    let file_path = temp.path().join("not-a-dir");
+    std::fs::write(&file_path, b"file").expect("file should write");
+
+    let mut map = base_runtime_map();
+    map.insert(
+        "IMGFLOP_ASSETS_DIR".to_string(),
+        file_path.to_string_lossy().to_string(),
+    );
+
+    let cfg = imgflop::config::RuntimeConfig::from_map(&map).expect("config should parse");
+    let err = cfg
+        .validate_startup()
+        .expect_err("startup validation should reject file path");
+    assert!(err.contains("IMGFLOP_ASSETS_DIR"));
+}
+
+#[test]
+fn runtime_config_validate_startup_rejects_invalid_db_url() {
+    let mut map = base_runtime_map();
+    map.insert("IMGFLOP_DB_URL".to_string(), "postgres://bad".to_string());
+
+    let cfg = imgflop::config::RuntimeConfig::from_map(&map).expect("config should parse");
+    let err = cfg
+        .validate_startup()
+        .expect_err("startup validation should reject invalid db url");
+    assert!(err.contains("IMGFLOP_DB_URL"));
+}
+
+fn base_runtime_map() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    map.insert("ADMIN_USER".to_string(), "admin".to_string());
+    map.insert(
+        "ADMIN_PASSWORD_HASH".to_string(),
+        "$argon2id$dummy".to_string(),
+    );
+    map
 }

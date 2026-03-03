@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use imgflop::{
     auth::AuthService,
@@ -18,9 +18,10 @@ async fn main() {
 
     let config = RuntimeConfig::from_env()
         .unwrap_or_else(|err| panic!("runtime configuration error: {err}"));
+    config
+        .validate_startup()
+        .unwrap_or_else(|err| panic!("runtime startup validation error: {err}"));
     let assets_root = PathBuf::from(&config.assets_dir);
-    fs::create_dir_all(&assets_root)
-        .unwrap_or_else(|err| panic!("failed to create assets dir {}: {err}", config.assets_dir));
 
     let pool = db::connect_pool(&config.database_url)
         .await
