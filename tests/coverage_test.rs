@@ -1,4 +1,10 @@
-use std::process::Command;
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    process::Command,
+    thread,
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -224,9 +230,43 @@ async fn unauthenticated_admin_poll_is_rejected() {
 }
 
 #[test]
-fn binary_starts_and_exits_successfully() {
-    let status = Command::new(env!("CARGO_BIN_EXE_imgflop"))
-        .status()
-        .expect("binary should run");
-    assert!(status.success());
+fn binary_serves_health_endpoint() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("ephemeral port should bind")
+        .local_addr()
+        .expect("local addr should resolve")
+        .port();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_imgflop"))
+        .env("IMGFLOP_BIND", format!("127.0.0.1:{port}"))
+        .spawn()
+        .expect("binary should start");
+
+    let mut response = String::new();
+    let mut success = false;
+
+    for _ in 0..40 {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut stream) => {
+                stream
+                    .write_all(
+                        b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("request should write");
+                stream
+                    .read_to_string(&mut response)
+                    .expect("response should read");
+                success = true;
+                break;
+            }
+            Err(_) => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(success, "server never became reachable");
+    assert!(response.contains("200 OK"));
+    assert!(response.contains("ok"));
 }
