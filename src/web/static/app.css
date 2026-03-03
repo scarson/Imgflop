@@ -27,6 +27,24 @@ body {
   background: #101821cc;
 }
 
+.topbar h1 {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.topbar h1::before {
+  content: "";
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background-image: url("/static/logo.png");
+  background-size: cover;
+  background-position: center;
+  box-shadow: 0 3px 10px #0008;
+}
+
 .topbar nav {
   display: flex;
   gap: 0.75rem;

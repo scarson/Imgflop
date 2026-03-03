@@ -103,6 +103,7 @@ fn app_router_with_state(state: AppState) -> Router {
         .route("/media/image/{id}", get(media_image))
         .route("/health", get(|| async { "ok" }))
         .route("/static/app.css", get(stylesheet))
+        .route("/static/logo.png", get(logo_image))
         .route("/admin", get(admin_home))
         .route("/admin/login", get(admin_login_page).post(admin_login))
         .route("/admin/logout", post(admin_logout))
@@ -245,6 +246,13 @@ async fn stylesheet() -> ([(&'static str, &'static str); 1], &'static str) {
     (
         [("content-type", "text/css; charset=utf-8")],
         include_str!("static/app.css"),
+    )
+}
+
+async fn logo_image() -> ([(&'static str, &'static str); 1], &'static [u8]) {
+    (
+        [("content-type", "image/png")],
+        &include_bytes!("../../img/imgflop-synthwave-logo-1.png")[..],
     )
 }
 
